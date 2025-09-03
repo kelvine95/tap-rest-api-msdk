@@ -42,42 +42,66 @@ from tap_rest_api_msdk.utils import flatten_json, get_start_date
 class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
     """Custom paginator that tracks era_id for incremental sync."""
 
-    def __init__(self, *args, era_field=None, max_pages_per_run=50, **kwargs):
+    def __init__(self, *args, era_field=None, max_pages_per_run=50, logger=None, **kwargs):
+        """
+        Initializes the paginator.
+        Args:
+            *args: Positional arguments for the base class.
+            era_field (str, optional): The name of the era field. Defaults to None.
+            max_pages_per_run (int, optional): Max pages to fetch per run. Defaults to 50.
+            logger (logging.Logger, optional): The logger instance. Defaults to None.
+            **kwargs: Keyword arguments for the base class.
+        """
         super().__init__(*args, **kwargs)
         self.era_field = era_field
         self.max_pages_per_run = max_pages_per_run
         self.pages_fetched = 0
         self.stop_pagination = False
         self.highest_era_seen = None
+        # Use the logger passed from the Stream, or create a default one
+        self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def has_more(self, response: requests.Response) -> bool:
         """Check if more pages exist and if we should continue."""
-        self.pages_fetched += 1
-
+        # Note: The SDK increments self.pages_fetched in the Stream class after
+        # a successful request, so we don't need to increment it here.
+        
+        # Check if the run has hit the configured page limit
         if self.pages_fetched >= self.max_pages_per_run:
             self.logger.info(
                 f"Reached page limit for this run ({self.max_pages_per_run} pages)."
             )
             return False
 
+        # Check if the parse_response method signaled a stop
         if self.stop_pagination:
-            self.logger.info("Stopping pagination due to era-based incremental sync.")
+            self.logger.info("Stopping pagination because a known era was reached.")
             return False
 
         response_data = response.json()
         total_pages = response_data.get("page_count") or response_data.get("pageCount")
+
         if total_pages is None:
             self.logger.warning(
-                "No 'page_count' or 'pageCount' found in response. Assuming no more pages."
+                "API response did not contain 'page_count' or 'pageCount'. "
+                "Assuming no more pages."
             )
             return False
 
-        # current_value is the next page to be fetched
-        has_more = self.current_value <= total_pages
-        if not has_more:
-            self.logger.info(f"No more pages. Current value: {self.current_value}, Total pages: {total_pages}")
-        return has_more
+        # The SDK's paginator increments `current_value` to be the *next* page number
+        # before this method is called. This logic checks if that next page is valid.
+        has_more_pages = self.current_value <= total_pages
+        
+        # As a safeguard, also check if the last response returned any records.
+        has_records = bool(response_data.get("data"))
 
+        if not has_more_pages:
+            self.logger.info(
+                f"No more pages to fetch. Next page would be {self.current_value}, "
+                f"but total pages is {total_pages}."
+            )
+
+        return has_more_pages and has_records
 
 class DynamicStream(RestApiStream):
     """Define custom stream with era-based incremental support."""
@@ -316,16 +340,17 @@ class DynamicStream(RestApiStream):
     def get_new_paginator(self):
         """Return the requested paginator with era-based support if configured."""
         self.logger.info(
-            f"the next_page_token_jsonpath = {self.next_page_token_jsonpath}."
+            f"the next_page_token_jsonpath = {getattr(self, 'next_page_token_jsonpath', None)}."
         )
 
         # For era-based incremental, use our custom paginator
         if self.era_based_incremental and self.pagination_request_style == "page_number_paginator":
             return EraBasedPageNumberPaginator(
                 start_value=self.pagination_initial_offset,
-                jsonpath=self.next_page_token_jsonpath,
+                jsonpath=getattr(self, 'next_page_token_jsonpath', None),
                 era_field=self.era_field,
-                max_pages_per_run=self.max_pages_per_run
+                max_pages_per_run=self.max_pages_per_run,
+                logger=self.logger  # <--- This is the crucial line that passes the logger
             )
         
         # Default paginators (existing logic)
@@ -373,14 +398,12 @@ class DynamicStream(RestApiStream):
                 pagination_page_size=self.pagination_page_size,
             )
         else:
-            self.logger.error(
+            msg = (
                 f"Unknown paginator {self.pagination_request_style}. Please declare "
                 f"a valid paginator."
             )
-            raise ValueError(
-                f"Unknown paginator {self.pagination_request_style}. Please declare "
-                f"a valid paginator."
-            )
+            self.logger.error(msg)
+            raise ValueError(msg)
 
     def get_starting_era(self, context: Optional[dict]) -> Optional[int]:
         """Get the last processed era_id from state."""
