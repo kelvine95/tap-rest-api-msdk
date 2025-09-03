@@ -6,6 +6,7 @@ from datetime import datetime
 from string import Template
 from typing import Any, Dict, Generator, Iterable, Optional, Union
 from urllib.parse import parse_qs, parse_qsl, urlparse
+import time
 
 import requests
 from singer_sdk.helpers import types
@@ -283,6 +284,38 @@ class DynamicStream(RestApiStream):
             self.pagination_page_size = pagination_page_size
 
         self.use_fake_since_parameter = False
+    
+    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
+        """Request records from REST endpoint(s), applying rate limiting.
+
+        This method overrides the default SDK method to add a client-side delay,
+        ensuring the tap respects the API's rate limit.
+
+        Args:
+            context: Stream partition or context dictionary.
+
+        Yields:
+            An item for every record in the response.
+        """
+        # Calculate the required delay to stay under 100 requests/minute.
+        # 60 seconds / 100 requests = 0.6 seconds/request. We add a small buffer.
+        rate_limit_delay_seconds = 0.7
+
+        # Call the original `request_records` method from the parent class
+        # to get its generator.
+        records_generator = super().request_records(context)
+        
+        # Iterate over the generator, yielding each record.
+        for record in records_generator:
+            yield record
+            
+            # After yielding all records from a page, pause.
+            # The `_page_count` is incremented by the SDK's paginator after each page.
+            if self.paginator.finished:
+                self.logger.info(
+                    f"Pausing for {rate_limit_delay_seconds} seconds to respect API rate limit."
+                )
+                time.sleep(rate_limit_delay_seconds)
 
     @property
     def http_headers(self) -> dict:
