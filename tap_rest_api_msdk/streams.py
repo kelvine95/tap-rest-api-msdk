@@ -285,37 +285,37 @@ class DynamicStream(RestApiStream):
 
         self.use_fake_since_parameter = False
     
-    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
-        """Request records from REST endpoint(s), applying rate limiting.
+    def _request(
+        self, prepared_request: requests.PreparedRequest, context: Optional[dict]
+    ) -> requests.Response:
+        """
+        Perform a request, logging the HTTP request and response.
 
-        This method overrides the default SDK method to add a client-side delay,
+        This method overrides the default to add a client-side delay,
         ensuring the tap respects the API's rate limit.
 
         Args:
+            prepared_request: The prepared request object to send.
             context: Stream partition or context dictionary.
 
-        Yields:
-            An item for every record in the response.
+        Returns:
+            The HTTP response object.
         """
         # Calculate the required delay to stay under 100 requests/minute.
-        # 60 seconds / 100 requests = 0.6 seconds/request. We add a small buffer.
+        # 60 seconds / 100 requests = 0.6 seconds/request. We add a buffer.
         rate_limit_delay_seconds = 0.7
 
-        # Call the original `request_records` method from the parent class
-        # to get its generator.
-        records_generator = super().request_records(context)
+        # Call the parent class's _request method to execute the API call
+        response = super()._request(prepared_request, context)
+
+        # After every successful request, pause to respect the rate limit
+        self.logger.info(
+            f"Pausing for {rate_limit_delay_seconds} seconds to respect API rate limit."
+        )
+        time.sleep(rate_limit_delay_seconds)
         
-        # Iterate over the generator, yielding each record.
-        for record in records_generator:
-            yield record
-            
-            # After yielding all records from a page, pause.
-            # The `_page_count` is incremented by the SDK's paginator after each page.
-            if self.paginator.finished:
-                self.logger.info(
-                    f"Pausing for {rate_limit_delay_seconds} seconds to respect API rate limit."
-                )
-                time.sleep(rate_limit_delay_seconds)
+        return response
+
 
     @property
     def http_headers(self) -> dict:
