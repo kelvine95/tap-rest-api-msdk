@@ -41,7 +41,7 @@ from tap_rest_api_msdk.utils import flatten_json, get_start_date
 
 class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
     """Custom paginator that tracks era_id for incremental sync."""
-    
+
     def __init__(self, *args, era_field=None, max_pages_per_run=50, **kwargs):
         super().__init__(*args, **kwargs)
         self.era_field = era_field
@@ -49,19 +49,34 @@ class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
         self.pages_fetched = 0
         self.stop_pagination = False
         self.highest_era_seen = None
-    
-    def has_more(self, response: requests.Response):
+
+    def has_more(self, response: requests.Response) -> bool:
         """Check if more pages exist and if we should continue."""
-        # Check if we've hit our page limit for this run
+        self.pages_fetched += 1
+
         if self.pages_fetched >= self.max_pages_per_run:
+            self.logger.info(
+                f"Reached page limit for this run ({self.max_pages_per_run} pages)."
+            )
             return False
-        
-        # Check if we've been signaled to stop (hit known era)
+
         if self.stop_pagination:
+            self.logger.info("Stopping pagination due to era-based incremental sync.")
             return False
-        
-        # Use parent's logic for checking if more pages exist
-        return super().has_more(response)
+
+        response_data = response.json()
+        total_pages = response_data.get("page_count") or response_data.get("pageCount")
+        if total_pages is None:
+            self.logger.warning(
+                "No 'page_count' or 'pageCount' found in response. Assuming no more pages."
+            )
+            return False
+
+        # current_value is the next page to be fetched
+        has_more = self.current_value <= total_pages
+        if not has_more:
+            self.logger.info(f"No more pages. Current value: {self.current_value}, Total pages: {total_pages}")
+        return has_more
 
 
 class DynamicStream(RestApiStream):
@@ -574,9 +589,7 @@ class DynamicStream(RestApiStream):
             # Get the last processed era from state
             last_era = self.get_starting_era(None)
             
-            # Track highest era seen and page count
-            self.pages_fetched = getattr(self, 'pages_fetched', 0) + 1
-            
+            # Track highest era seen
             for record in extract_jsonpath(self.records_path, input=response.json()):
                 if self.era_field in record:
                     era_value = record[self.era_field]
