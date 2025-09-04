@@ -31,35 +31,27 @@ from tap_rest_api_msdk.pagination import (
 )
 from tap_rest_api_msdk.utils import flatten_json, get_start_date
 
-
 class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
     """Custom paginator that tracks era_id for incremental sync."""
 
     def __init__(self, *args, era_field=None, max_pages_per_run=50, logger=None, **kwargs):
-        """Initialize the paginator."""
         super().__init__(*args, **kwargs)
         self.era_field = era_field
         self.max_pages_per_run = max_pages_per_run
         self.pages_fetched = 0
         self.stop_pagination = False
-        self.highest_era_seen = None
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def has_more(self, response: requests.Response) -> bool:
-        """Return True if there are more pages to fetch.
-
-        Enhanced to:
-        - stop at known era via self.stop_pagination
-        - respect max_pages_per_run
-        - fall back to computing total_pages from item_count and page_size
-            when page_count/pageCount is absent
-        """
+        """Return True if there are more pages to fetch."""
         self.pages_fetched += 1
 
+        # Check if we should stop due to reaching known data
         if self.stop_pagination:
             self.logger.info("Stopping pagination - reached known era")
             return False
 
+        # Respect max pages per run
         if self.max_pages_per_run and self.pages_fetched >= self.max_pages_per_run:
             self.logger.info(f"Reached page limit ({self.max_pages_per_run} pages)")
             return False
@@ -70,33 +62,35 @@ class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
             self.logger.warning("Response did not contain JSON; stopping.")
             return False
 
-        has_records = bool(payload.get("data"))
-
-        # Prefer page_count/pageCount from API
-        total_pages = payload.get("page_count") or payload.get("pageCount")
-
-        # Fallback: derive from item_count and configured page_size (if available)
-        if total_pages is None:
-            item_count = payload.get("item_count")
-            page_size = getattr(self, "page_size", None)
-            try:
-                if item_count is not None and page_size:
-                    ic = int(item_count)
-                    ps = int(page_size)
-                    if ps > 0:
-                        total_pages = (ic + ps - 1) // ps
-            except Exception:
-                total_pages = None
-
-        if total_pages is None:
-            self.logger.warning("No page count in response, assuming no more pages")
+        # Check if we have any records
+        data = payload.get("data", [])
+        if not data:
+            self.logger.info("No data in response, stopping")
             return False
 
+        # Get page count info
+        total_pages = payload.get("page_count") or payload.get("pageCount")
+        
+        if total_pages is None:
+            # Try to derive from item_count
+            item_count = payload.get("item_count")
+            page_size = getattr(self, "page_size", None)
+            if item_count is not None and page_size:
+                try:
+                    total_pages = (int(item_count) + int(page_size) - 1) // int(page_size)
+                except Exception:
+                    self.logger.warning("Could not calculate total pages")
+                    return False
+            else:
+                return False
+
         has_more_pages = self.current_value < total_pages
+        
         if not has_more_pages:
             self.logger.info(f"No more pages (current: {self.current_value}, total: {total_pages})")
+        
+        return has_more_pages
 
-        return has_more_pages and has_records
 
 class DynamicStream(RestApiStream):
     """Define custom stream with era-based incremental support."""
@@ -381,54 +375,46 @@ class DynamicStream(RestApiStream):
             raise ValueError(msg)
 
     def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        """Parse response with era-based filtering and deduplication."""
+        """Parse response with era-based filtering and early termination."""
         if not self.era_based_incremental:
-            # Standard parsing for non-era streams
             yield from extract_jsonpath(self.records_path, input=response.json())
             return
 
-        # Get the composite bookmark from state
         bookmark = self.get_starting_composite_bookmark(None)
         last_era = bookmark.get("last_era_id") if bookmark else None
         processed_in_last_era = set(bookmark.get("processed_in_last_era", [])) if bookmark else set()
         
-        # Track if we should stop pagination
-        should_stop = False
+        # Track if we've seen any old data
+        seen_old_era = False
+        records_yielded = 0
         
         for record in extract_jsonpath(self.records_path, input=response.json()):
             era_value = record.get(self.era_field)
             
-            # Skip records without era field
             if era_value is None:
                 self.logger.warning(f"Record missing era field '{self.era_field}': {record}")
                 continue
             
-            # Filter 1: Initial sync - skip records older than starting point
+            # For initial sync with starting point
             if not last_era and self.initial_sync_era_id and era_value < self.initial_sync_era_id:
                 self.logger.debug(f"Skipping era {era_value} < initial_sync_era_id {self.initial_sync_era_id}")
-                continue
+                seen_old_era = True
+                break  # Stop processing this page
             
-            # Filter 2: Incremental sync - stop when reaching older eras
-            if last_era and era_value < last_era:
-                self.logger.info(f"Reached era {era_value} < last_era {last_era}, stopping pagination")
-                should_stop = True
-                break
+            # For incremental sync - stop immediately when hitting old data
+            if last_era and era_value <= last_era:
+                self.logger.info(f"Reached era {era_value} <= last_era {last_era}, stopping")
+                seen_old_era = True
+                break  # Stop processing this page
             
-            # Filter 3: Deduplicate within the last processed era
-            if last_era and era_value == last_era:
-                # Create unique record identifier
-                record_id = self._get_record_id(record, era_value)
-                if record_id in processed_in_last_era:
-                    self.logger.debug(f"Skipping duplicate record: {record_id}")
-                    continue
-            
-            # Track this record for the current run
+            # This is a new record, track and yield it
             self._track_record(record, era_value)
-            
+            records_yielded += 1
             yield record
         
-        # Signal paginator to stop if needed
-        if should_stop and hasattr(self._paginator, 'stop_pagination'):
+        # Signal paginator to stop if we've seen old data
+        if seen_old_era and hasattr(self._paginator, 'stop_pagination'):
+            self.logger.info(f"Setting stop_pagination after yielding {records_yielded} new records")
             self._paginator.stop_pagination = True
 
     def _get_record_id(self, record: dict, era_value: Any) -> str:
@@ -520,17 +506,15 @@ class DynamicStream(RestApiStream):
         return None
     
     def _write_composite_bookmark(self, context: Optional[dict]) -> None:
-        """Persist composite bookmark into Singer state and emit a STATE message."""
+        """Persist composite bookmark and emit STATE message immediately."""
         if not self._composite_bookmark:
             return
 
-        # Convert set -> sorted list for JSON/state
         processed = self._composite_bookmark.get("processed_in_last_era", set())
         self._composite_bookmark["processed_in_last_era"] = sorted(list(processed))
 
         tap_state = getattr(self, "_tap_state", {}) or {}
 
-        # Write composite bookmark where we also read it from
         write_stream_state(
             tap_state,
             self.name,
@@ -538,9 +522,13 @@ class DynamicStream(RestApiStream):
             val=self._composite_bookmark,
         )
 
-        # Also keep SDK-standard replication key/value updated
         if self.replication_key:
-            write_stream_state(tap_state, self.name, key="replication_key", val=self.replication_key)
+            write_stream_state(
+                tap_state, 
+                self.name, 
+                key="replication_key", 
+                val=self.replication_key
+            )
             write_stream_state(
                 tap_state,
                 self.name,
@@ -549,7 +537,11 @@ class DynamicStream(RestApiStream):
             )
 
         self._tap_state = tap_state
+        
         self._write_state_message()
+        
+        self.logger.info(f"Saved composite bookmark: last_era_id={self._composite_bookmark.get('last_era_id')}, "
+                        f"processed_count={len(processed)}")
 
     def _get_url_params_page_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
