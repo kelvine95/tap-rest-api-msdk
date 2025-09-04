@@ -46,6 +46,14 @@ class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
     def has_more(self, response: requests.Response) -> bool:
+        """Return True if there are more pages to fetch.
+
+        Enhanced to:
+        - stop at known era via self.stop_pagination
+        - respect max_pages_per_run
+        - fall back to computing total_pages from item_count and page_size
+            when page_count/pageCount is absent
+        """
         self.pages_fetched += 1
 
         if self.stop_pagination:
@@ -62,14 +70,28 @@ class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
             self.logger.warning("Response did not contain JSON; stopping.")
             return False
 
-        total_pages = payload.get("page_count") or payload.get("pageCount")
         has_records = bool(payload.get("data"))
+
+        # Prefer page_count/pageCount from API
+        total_pages = payload.get("page_count") or payload.get("pageCount")
+
+        # Fallback: derive from item_count and configured page_size (if available)
+        if total_pages is None:
+            item_count = payload.get("item_count")
+            page_size = getattr(self, "page_size", None)
+            try:
+                if item_count is not None and page_size:
+                    ic = int(item_count)
+                    ps = int(page_size)
+                    if ps > 0:
+                        total_pages = (ic + ps - 1) // ps
+            except Exception:
+                total_pages = None
 
         if total_pages is None:
             self.logger.warning("No page count in response, assuming no more pages")
             return False
 
-        # STRICT: continue only while current page < total pages
         has_more_pages = self.current_value < total_pages
         if not has_more_pages:
             self.logger.info(f"No more pages (current: {self.current_value}, total: {total_pages})")
@@ -273,17 +295,42 @@ class DynamicStream(RestApiStream):
             return super().backoff_wait_generator()
 
     def get_new_paginator(self):
-        """Return the appropriate paginator."""
-        # Use custom era-based paginator if configured
+        """Return the appropriate paginator.
+
+        For era-based incremental + page-number pagination:
+        - resume from saved page within the last era (if present)
+        - pass page_size to paginator so it can derive total_pages from item_count
+        """
+        # Era-based, page-number paginator with resume support
         if self.era_based_incremental and self.pagination_request_style == "page_number_paginator":
-            return EraBasedPageNumberPaginator(
-                start_value=self.pagination_initial_offset,
+            # Default starting page
+            start_value = self.pagination_initial_offset
+
+            # Try resuming page within the last era
+            try:
+                bm = self.get_starting_composite_bookmark(None) or {}
+                if bm.get("page_at_last_era"):
+                    start_value = bm["page_at_last_era"]
+            except Exception:
+                pass
+
+            paginator = EraBasedPageNumberPaginator(
+                start_value=start_value,
                 jsonpath=getattr(self, 'next_page_token_jsonpath', None),
                 era_field=self.era_field,
                 max_pages_per_run=self.max_pages_per_run,
-                logger=self.logger
+                logger=self.logger,
             )
-        
+
+            # Let the paginator know the page size (for fallback math)
+            try:
+                if self.pagination_page_size:
+                    setattr(paginator, "page_size", int(self.pagination_page_size))
+            except Exception:
+                pass
+
+            return paginator
+
         # Default paginators
         if (
             self.pagination_request_style == "jsonpath_paginator"
@@ -385,25 +432,45 @@ class DynamicStream(RestApiStream):
             self._paginator.stop_pagination = True
 
     def _get_record_id(self, record: dict, era_value: Any) -> str:
-        """Generate unique identifier for a record."""
-        validator = record.get("validator_public_key", "")
-        timestamp = record.get("timestamp", "")
-        return f"{validator}_{timestamp}_{era_value}"
+        """Generate a stable unique identifier for a reward row.
+
+        Uses multiple fields to avoid collisions and ensure robust de-dupe
+        within the last processed era.
+        """
+        parts = [
+            str(record.get("delegator_identifier", "")),
+            str(record.get("validator_public_key", "")),
+            str(era_value),
+            str(record.get("timestamp", "")),
+        ]
+        return "_".join(parts)
 
     def _track_record(self, record: dict, era_value: Any) -> None:
-        """Track record in the current run's composite bookmark."""
+        """Track record in the current run's composite bookmark.
+
+        Also stores the current page index (if available) so we can resume
+        mid-era without restarting at page 1 in very large eras.
+        """
         record_id = self._get_record_id(record, era_value)
-        
+
         # Update composite bookmark
         if not self._composite_bookmark or era_value > self._composite_bookmark.get("last_era_id", -1):
             # New highest era
             self._composite_bookmark = {
                 "last_era_id": era_value,
-                "processed_in_last_era": {record_id}
+                "processed_in_last_era": {record_id},
             }
         elif era_value == self._composite_bookmark.get("last_era_id"):
             # Same era, add to set
             self._composite_bookmark["processed_in_last_era"].add(record_id)
+
+        # Persist current page (if known) to allow mid-era resume
+        try:
+            if hasattr(self, "_paginator") and hasattr(self._paginator, "current_value"):
+                self._composite_bookmark["page_at_last_era"] = self._paginator.current_value
+        except Exception:
+            # Non-fatal: ignore if paginator isn't available yet
+            pass
 
     def post_process(self, row: dict, context: Optional[dict] = None) -> Optional[dict]:
         if self.era_based_incremental and self.replication_key:
@@ -487,7 +554,7 @@ class DynamicStream(RestApiStream):
     def _get_url_params_page_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return URL parameters for page-style pagination with a hard cap limit=10."""
+        """Return URL parameters for page-style pagination with a configurable limit."""
         params: dict = {}
 
         # Start with base params
@@ -500,13 +567,13 @@ class DynamicStream(RestApiStream):
             next_page_param = self.pagination_next_page_param or "page"
             params[next_page_param] = next_page_token
 
-        # Always enforce CSPR limit cap
+        # Respect configured page size (remove previous hard clamp to 10)
         limit_key = self.pagination_limit_per_page_param or "limit"
         try:
-            current = int(params.get(limit_key, 10))
+            desired = int(self.pagination_page_size or params.get(limit_key, 100))
         except Exception:
-            current = 10
-        params[limit_key] = min(current, 10)
+            desired = 100
+        params[limit_key] = desired
 
         # Do NOT add date filters when using era-based incremental
         if not self.era_based_incremental and self.replication_key:
@@ -527,11 +594,10 @@ class DynamicStream(RestApiStream):
 
         return params
 
-
     def _get_url_params_offset_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return URL parameters for offset-style pagination with a hard cap limit=10."""
+        """Return URL parameters for offset-style pagination with a configurable limit."""
         params: dict = {}
 
         if self.params:
@@ -543,17 +609,12 @@ class DynamicStream(RestApiStream):
             params[next_page_param] = next_page_token
 
         limit_key = self.pagination_limit_per_page_param or "limit"
-        # Prefer configured pagination_page_size; clamp to 10; otherwise clamp any existing
-        if self.pagination_page_size is not None:
-            try:
-                params[limit_key] = min(int(self.pagination_page_size), 10)
-            except Exception:
-                params[limit_key] = 10
-        else:
-            try:
-                params[limit_key] = min(int(params.get(limit_key, 10)), 10)
-            except Exception:
-                params[limit_key] = 10
+        # Prefer configured pagination_page_size; else existing value; else 100
+        try:
+            desired = int(self.pagination_page_size or params.get(limit_key, 100))
+        except Exception:
+            desired = 100
+        params[limit_key] = desired
 
         # Do NOT add date filters when using era-based incremental
         if not self.era_based_incremental and self.replication_key:
