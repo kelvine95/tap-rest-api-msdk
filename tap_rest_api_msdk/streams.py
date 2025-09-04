@@ -250,13 +250,13 @@ class DynamicStream(RestApiStream):
         self, prepared_request: requests.PreparedRequest, context: Optional[dict]
     ) -> requests.Response:
         """Perform a request with rate limiting."""
+        # Apply rate limit delay BEFORE the request to ensure proper spacing
+        if self.rate_limit_delay and self.rate_limit_delay > 0:
+            self.logger.debug(f"Applying rate limit delay of {self.rate_limit_delay}s")
+            time.sleep(self.rate_limit_delay)
+        
         # Execute the request
         response = super()._request(prepared_request, context)
-        
-        # Apply rate limit delay if configured
-        if self.rate_limit_delay > 0:
-            self.logger.debug(f"Rate limit delay: {self.rate_limit_delay}s")
-            time.sleep(self.rate_limit_delay)
         
         return response
 
