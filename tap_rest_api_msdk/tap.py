@@ -129,7 +129,7 @@ class TapRestApiMsdk(Tap):
             "Note: Any required double quotes in the query template must "
             "be escaped.",
         ),
-        # New era-based incremental properties
+        # Era-based incremental properties
         th.Property(
             "era_based_incremental",
             th.BooleanType,
@@ -156,6 +156,21 @@ class TapRestApiMsdk(Tap):
             description="Maximum number of pages to fetch per run when using "
             "era_based_incremental. Helps respect API rate limits. "
             "Defaults to 50.",
+        ),
+        th.Property(
+            "initial_sync_era_id",
+            th.IntegerType,
+            required=False,
+            description="Starting era_id for initial sync when using era_based_incremental. "
+            "Records with era_id less than this value will be skipped during initial sync.",
+        ),
+        th.Property(
+            "rate_limit_delay",
+            th.NumberType,
+            default=0.7,
+            required=False,
+            description="Delay in seconds between API requests to respect rate limits. "
+            "Defaults to 0.7 seconds (for ~85 requests/minute).",
         ),
     )
 
@@ -505,6 +520,14 @@ class TapRestApiMsdk(Tap):
                 "max_pages_per_run",
                 self.config.get("max_pages_per_run", 50)
             )
+            initial_sync_era_id = stream.get(
+                "initial_sync_era_id",
+                self.config.get("initial_sync_era_id", None)
+            )
+            rate_limit_delay = stream.get(
+                "rate_limit_delay",
+                self.config.get("rate_limit_delay", 0.7)
+            )
 
             schema = {}
             schema_config = stream.get("schema")
@@ -583,6 +606,8 @@ class TapRestApiMsdk(Tap):
                     era_based_incremental=era_based_incremental,
                     era_field=era_field,
                     max_pages_per_run=max_pages_per_run,
+                    initial_sync_era_id=initial_sync_era_id,
+                    rate_limit_delay=rate_limit_delay,
                 )
             )
 
