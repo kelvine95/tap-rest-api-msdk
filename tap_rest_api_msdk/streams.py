@@ -12,8 +12,8 @@ from urllib.parse import parse_qs, parse_qsl, urlparse
 import requests
 from singer_sdk.helpers import types
 from singer_sdk.helpers.jsonpath import extract_jsonpath
-# Import added for the fix
-from singer_sdk.messages import StateMessage, write_message
+from singer_sdk.helpers.state import StateMessage
+from singer_sdk.singer_helpers import write_message
 from singer_sdk.pagination import (
     BaseHATEOASPaginator,
     HeaderLinkPaginator,
@@ -486,7 +486,7 @@ class DynamicStream(RestApiStream):
                 self._composite_bookmark.get("last_era_id")
             )
         
-        # FIX: Write the state using the modern SDK method
+        # Write the state message using the correct, imported function
         write_message(StateMessage(value=state))
 
     def _get_url_params_page_style(
