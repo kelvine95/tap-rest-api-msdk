@@ -138,10 +138,11 @@ class DynamicStream(RestApiStream):
         backoff_time_extension: Optional[int] = 0,
         store_raw_json_message: Optional[bool] = False,
         authenticator: Optional[object] = None,
-        # New parameters for era-based incremental
+        # New/modified parameters for era-based incremental
         era_based_incremental: Optional[bool] = False,
         era_field: Optional[str] = None,
         max_pages_per_run: Optional[int] = 50,
+        initial_sync_era_id: Optional[int] = None, # New parameter
     ) -> None:
         """Class initialization with era-based incremental support.
 
@@ -198,9 +199,12 @@ class DynamicStream(RestApiStream):
         self.era_based_incremental = era_based_incremental
         self.era_field = era_field or "era_id"
         self.max_pages_per_run = max_pages_per_run
-        self.highest_era_in_state = None
-        self.highest_era_seen = None
-        self.pages_fetched = 0
+        
+        # New setting for the initial sync filter
+        self.initial_sync_era_id = initial_sync_era_id
+
+        # This will hold the bookmark that is built during the current run
+        self._run_state_bookmark: Dict[str, Any] = {}
 
         if next_page_token_path:
             self.next_page_token_jsonpath = next_page_token_path
@@ -209,7 +213,7 @@ class DynamicStream(RestApiStream):
             or pagination_request_style == "default"
         ):
             self.next_page_token_jsonpath = "$.next_page"
-        
+
         get_url_params_styles = {
             "style1": self._get_url_params_offset_style,
             "offset": self._get_url_params_offset_style,
@@ -217,12 +221,6 @@ class DynamicStream(RestApiStream):
             "header_link": self._get_url_params_header_link,
             "hateoas_body": self._get_url_params_hateoas_body,
         }
-
-        # Selecting the appropriate method to send Parameters as part of the
-        # request. If use_request_body_not_params is set the parameters are sent
-        # in the request body instead of request parameters. The
-        # pagination_response_style config determines what style of parameter
-        # processing is invoked.
 
         self.use_request_body_not_params = use_request_body_not_params
         self.backoff_type = backoff_type
@@ -232,12 +230,11 @@ class DynamicStream(RestApiStream):
         if self.use_request_body_not_params:
             self.prepare_request_payload = get_url_params_styles.get(
                 pagination_response_style, self._get_url_params_page_style
-            ) # Defaults to page_style url_params
+            )
         else:
             self.get_url_params = get_url_params_styles.get(
                 pagination_response_style, self._get_url_params_page_style
-            ) # Defaults to page_style url_params
-
+            )
         self.pagination_request_style = pagination_request_style
         self.pagination_results_limit = pagination_results_limit
         self.pagination_next_page_param = pagination_next_page_param
@@ -316,7 +313,15 @@ class DynamicStream(RestApiStream):
         
         return response
 
-
+    def get_starting_bookmark(self, context: Optional[dict]) -> Optional[dict]:
+        """Get the last processed composite bookmark from state."""
+        if not self.era_based_incremental:
+            return None
+        
+        state = self.get_stream_or_partition_state(context)
+        # The SDK stores the simple replication_key_value, we need our custom bookmark
+        return state.get("bookmarks", {}).get(self.name) 
+    
     @property
     def http_headers(self) -> dict:
         """Return the http headers needed.
@@ -640,56 +645,76 @@ class DynamicStream(RestApiStream):
         return params
 
     def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        """Parse response with era-based filtering."""
-        if self.era_based_incremental:
-            # Get the last processed era from state
-            last_era = self.get_starting_era(None)
-            
-            # Track highest era seen
-            for record in extract_jsonpath(self.records_path, input=response.json()):
-                if self.era_field in record:
-                    era_value = record[self.era_field]
-                    
-                    # Track highest era
-                    if self.highest_era_seen is None or era_value > self.highest_era_seen:
-                        self.highest_era_seen = era_value
-                    
-                    # Skip records we've already processed
-                    # Since API returns newest first (DESC), stop when we hit known data
-                    if last_era and era_value <= last_era:
-                        self.logger.info(f"Reached known era {era_value}, stopping pagination")
-                        # Signal paginator to stop
-                        if hasattr(self._paginator, 'stop_pagination'):
-                            self._paginator.stop_pagination = True
-                        # Don't yield this record or any after it
-                        return
-                    
-                    yield record
-                else:
-                    # No era field, yield as normal
-                    yield record
-        else:
-            # Non-era-based, use original logic
+        """Parse response with composite bookmarking and initial sync filtering."""
+        if not self.era_based_incremental:
             yield from extract_jsonpath(self.records_path, input=response.json())
+            return
 
-    def post_process(
-        self,
-        row: types.Record,
-        context: Optional[types.Context] = None,
-    ) -> Optional[dict]:
-        """Process records and update state for era-based incremental."""
-        processed = flatten_json(row, self.except_keys, self.store_raw_json_message)
+        bookmark = self.get_starting_bookmark(None)
+        last_era = bookmark.get("last_era_id") if bookmark else None
+        seen_in_last_era = set(bookmark.get("processed_in_last_era", [])) if bookmark else set()
         
-        # Update replication key value for era-based incremental
+        for record in extract_jsonpath(self.records_path, input=response.json()):
+            era_value = record.get(self.era_field)
+            if era_value is None:
+                yield record  # Yield records without an era field
+                continue
+
+            # --- Filtering Logic ---
+            # 1. Initial Sync Filter: Skip records older than the starting point on a full refresh
+            if not last_era and self.initial_sync_era_id and era_value < self.initial_sync_era_id:
+                continue
+
+            # 2. Incremental Sync Filter: Stop when we reach eras older than our bookmark
+            if last_era and era_value < last_era:
+                self.logger.info(f"Reached era {era_value}, which is older than the last bookmarked era {last_era}. Halting pagination.")
+                if hasattr(self._paginator, "stop_pagination"):
+                    self._paginator.stop_pagination = True
+                return # Stop processing this page
+
+            # 3. Incremental Sync Filter: Skip records within the last-seen era that were already processed
+            if last_era and era_value == last_era:
+                record_id = (
+                    f'{record.get("validator_public_key")}_'
+                    f'{record.get("timestamp")}_{era_value}'
+                )
+                if record_id in seen_in_last_era:
+                    continue # Skip already processed record
+            
+            yield record
+
+    def post_process(self, row: dict, context: Optional[dict] = None) -> Optional[dict]:
+        """Process records and build the composite bookmark for the current run."""
         if self.era_based_incremental and self.era_field in row:
-            era_value = row[self.era_field]
-            if self.replication_key and self.replication_key == self.era_field:
-                # Update the replication key value to track highest era
-                current_value = self.get_starting_replication_key_value(context)
-                if current_value is None or era_value > current_value:
-                    self._increment_stream_state(
-                        {self.replication_key: era_value},
-                        context=context
-                    )
+            era = row[self.era_field]
+            ts = row.get("timestamp")
+            validator = row.get("validator_public_key")
+            
+            # Create a unique identifier for the record
+            record_id = f"{validator}_{ts}_{era}"
+
+            current_bookmark_era = self._run_state_bookmark.get("last_era_id")
+
+            if not current_bookmark_era or era > current_bookmark_era:
+                # This is the first record of the run OR the first record of a newer era
+                self._run_state_bookmark["last_era_id"] = era
+                self._run_state_bookmark["processed_in_last_era"] = {record_id}
+            elif era == current_bookmark_era:
+                # Still in the same era, add this record's ID to the set
+                self._run_state_bookmark["processed_in_last_era"].add(record_id)
+
+        return flatten_json(row, self.except_keys, self.store_raw_json_message)
+
+    def _after_sync(self, context: Optional[dict]) -> None:
+        """Write the composite bookmark to the state file at the end of a sync."""
+        if not self.era_based_incremental or not self._run_state_bookmark:
+            return
+
+        # Convert set to a sorted list for deterministic STATE messages
+        processed_set = self._run_state_bookmark.get("processed_in_last_era", set())
+        self._run_state_bookmark["processed_in_last_era"] = sorted(list(processed_set))
         
-        return processed
+        self.logger.info(f"Writing final bookmark to state: {self._run_state_bookmark}")
+        # Use _write_state_message to emit a custom bookmark structure
+        self._write_state_message({"bookmarks": {self.name: self._run_state_bookmark}})
+        
