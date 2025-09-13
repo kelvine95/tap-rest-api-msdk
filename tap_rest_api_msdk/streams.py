@@ -65,11 +65,12 @@ class IterativeDynamicStream(RestApiStream):
         authenticator: Optional[object] = None,
         iteration_config: Optional[dict] = None,
     ) -> None:
-        super().__init__(tap=tap, name=tap.name, schema=schema)
+        # ✅ FIX 1: Give the stream its own real name (not the tap's name)
+        super().__init__(tap=tap, name=name, schema=schema)
 
         self.name = name
         self.path = path
-        self.params = params.copy() if params else {}
+        self.params = (params or {}).copy()
         self.headers = headers
         self.assigned_authenticator = authenticator
         self._authenticator = authenticator
@@ -112,9 +113,13 @@ class IterativeDynamicStream(RestApiStream):
         }
 
         if self.use_request_body_not_params:
-            self.prepare_request_payload = get_url_params_styles.get(pagination_response_style, self._get_url_params_page_style)
+            self.prepare_request_payload = get_url_params_styles.get(
+                pagination_response_style, self._get_url_params_page_style
+            )
         else:
-            self.get_url_params = get_url_params_styles.get(pagination_response_style, self._get_url_params_page_style)
+            self.get_url_params = get_url_params_styles.get(
+                pagination_response_style, self._get_url_params_page_style
+            )
 
         self.pagination_request_style = pagination_request_style
         self.pagination_results_limit = pagination_results_limit
@@ -130,21 +135,24 @@ class IterativeDynamicStream(RestApiStream):
 
         # Page size & caps
         if self.pagination_request_style == "restapi_header_link_paginator":
-            self.pagination_page_size = pagination_page_size or int(self.params.get(self.pagination_limit_per_page_param or "per_page", 25))
+            self.pagination_page_size = (
+                pagination_page_size
+                or int(self.params.get(self.pagination_limit_per_page_param or "per_page", 25))
+            )
         elif self.pagination_request_style in ["style1", "offset_paginator"]:
-            if pagination_page_size:
-                self.pagination_page_size = pagination_page_size
-            else:
-                self.pagination_page_size = int(self.params.get(self.pagination_limit_per_page_param or "limit", 25))
+            self.pagination_page_size = (
+                pagination_page_size
+                or int(self.params.get(self.pagination_limit_per_page_param or "limit", 25))
+            )
         else:
             self.pagination_page_size = pagination_page_size
 
-        # Global/stream run caps for cost control
+        # ✅ FIX 2: Keep run caps on the tap using _tap (not .tap)
         self.max_records_per_stream = self.config.get("max_records_per_stream")
         self.max_records_total = self.config.get("max_records_total")
         self._emitted_in_stream = 0
-        if not hasattr(self.tap, "_emitted_total"):
-            self.tap._emitted_total = 0
+        if not hasattr(self._tap, "_emitted_total"):
+            self._tap._emitted_total = 0  # type: ignore[attr-defined]
 
         # Identify endpoints
         p = (self.original_path or "").strip()
@@ -155,12 +163,11 @@ class IterativeDynamicStream(RestApiStream):
         # Track current iteration
         self.current_iteration_value = None
 
-        # In-run seen IDs cache (cheap dedupe safeguard)
+        # In-run dedupe safeguard
         self._seen_ids_this_run: set[str] = set()
 
     # ---------- helpers ----------
     def _ctx(self, value: str) -> dict:
-        # Partitioned state keys → per iteration value bookmark
         return {"iteration_type": self.iteration_type, "iteration_value": value}
 
     def _iso_for_query(self, dt: datetime) -> str:
@@ -179,7 +186,8 @@ class IterativeDynamicStream(RestApiStream):
             return None
 
     def _stop_for_caps(self) -> bool:
-        if self.max_records_total is not None and self.tap._emitted_total >= self.max_records_total:
+        # Use _tap for shared counters
+        if self.max_records_total is not None and self._tap._emitted_total >= self.max_records_total:  # type: ignore[attr-defined]
             return True
         if self.max_records_per_stream is not None and self._emitted_in_stream >= self.max_records_per_stream:
             return True
@@ -202,7 +210,7 @@ class IterativeDynamicStream(RestApiStream):
             # Update request per iteration
             self._update_request_for_iteration(value)
 
-            # Inject incremental filters from bookmark BEFORE requesting first page
+            # Inject incremental filters from bookmark BEFORE first page
             last_dt = self.get_starting_timestamp(iter_ctx)
             if last_dt:
                 if self._is_advanced_search:
@@ -211,7 +219,7 @@ class IterativeDynamicStream(RestApiStream):
                     self.params["query"] = (base_q + " " + since_q).strip()
                 elif self._is_mentions:
                     self.params["sinceTime"] = str(self._unix_secs(last_dt))
-                # last_tweets: no param → we will early-stop below
+                # last_tweets: no server-side since param → early-stop below
 
             stop_iteration = False
             try:
@@ -220,14 +228,13 @@ class IterativeDynamicStream(RestApiStream):
                         stop_iteration = True
                         break
 
-                    # Early-stop for last_tweets when we reach <= bookmark
+                    # Early-stop for last_tweets at bookmark
                     if self._is_last_tweets and last_dt:
                         rec_dt = self._created_at_to_dt(record)
                         if rec_dt and rec_dt <= last_dt:
                             stop_iteration = True
                             break
 
-                    # In-run dedupe safeguard by tweet id
                     rid = record.get("id")
                     if rid and rid in self._seen_ids_this_run:
                         continue
@@ -240,7 +247,6 @@ class IterativeDynamicStream(RestApiStream):
                 if not self.iteration_config.get("continue_on_error", True):
                     raise
 
-            # Reset & go next
             self._reset_after_iteration()
             if stop_iteration:
                 continue
@@ -268,7 +274,7 @@ class IterativeDynamicStream(RestApiStream):
         self.params = self.original_params.copy()
         self.current_iteration_value = None
 
-    # ---------- base request plumbing ----------
+    # ---------- post-process & counters ----------
     def post_process(self, row: types.Record, context: Optional[types.Context] = None) -> Optional[dict]:
         processed = flatten_json(row, self.except_keys, self.store_raw_json_message)
 
@@ -279,34 +285,12 @@ class IterativeDynamicStream(RestApiStream):
             processed["_extracted_at"] = datetime.utcnow().isoformat()
 
         self._emitted_in_stream += 1
-        self.tap._emitted_total += 1
+        # share totals via _tap (not .tap)
+        self._tap._emitted_total += 1  # type: ignore[attr-defined]
 
         return processed
 
-    @property
-    def http_headers(self) -> dict:
-        headers = {}
-        if "user_agent" in self.config:
-            headers["User-Agent"] = self.config.get("user_agent")
-        if self.headers:
-            headers.update(self.headers)
-        return headers
-
-    def backoff_wait_generator(self) -> Generator[Union[int, float], None, None]:
-        def _backoff_from_headers(exception):
-            return int(exception.response.headers.get(self.backoff_param, 0)) + self.backoff_time_extension
-
-        def _get_wait_time_from_response(exception):
-            response_message = exception.response.json().get("message", 0)
-            res = [int(i) for i in response_message.split() if i.isdigit()]
-            return int(max(res)) + self.backoff_time_extension
-
-        if self.backoff_type == "message":
-            return self.backoff_runtime(value=_get_wait_time_from_response)
-        elif self.backoff_type == "header":
-            return self.backoff_runtime(value=_backoff_from_headers)
-        return super().backoff_wait_generator()
-
+    # ---------- paginator selection ----------
     def get_new_paginator(self):
         self.logger.info(f"Using paginator: {self.pagination_request_style}")
 
@@ -347,7 +331,7 @@ class IterativeDynamicStream(RestApiStream):
             )
         raise ValueError(f"Unknown paginator {self.pagination_request_style}")
 
-    # ---------- URL param builders (respect partitioned state) ----------
+    # ---------- URL param builders ----------
     def _get_url_params_page_style(self, context: Optional[dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
         last_run_date = get_start_date(self, context)
         params: dict = {**self.params} if self.params else {}
@@ -402,7 +386,7 @@ class IterativeDynamicStream(RestApiStream):
         if self.replication_key == "updated_at":
             params["sort"] = "updated"
             params["direction"] = "asc"
-        elif self.replication_key in ["starred_at","created_at"]:
+        elif self.replication_key in ["starred_at", "created_at"]:
             params["sort"] = "created"
             params["direction"] = "desc"
         elif self.replication_key == "commit_timestamp":
