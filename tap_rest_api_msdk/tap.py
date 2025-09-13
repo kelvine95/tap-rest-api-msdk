@@ -1,10 +1,7 @@
 # tap_rest_api_msdk/tap.py
 from __future__ import annotations
-
-from typing import List, Dict, Any, Optional
-
-from singer_sdk import Tap
-from singer_sdk import typing as th
+from typing import List, Dict, Any
+from singer_sdk import Tap, typing as th
 
 from .streams import (
     TwitterAdvancedSearchStream,
@@ -17,8 +14,6 @@ PLUGIN_NAME = "tap-rest-api-msdk"
 
 
 class TapRestApiMsdk(Tap):
-    """TwitterAPI.io – purpose-built dynamic tap using Singer SDK."""
-
     name = PLUGIN_NAME
 
     config_jsonschema = th.PropertiesList(
@@ -37,34 +32,24 @@ class TapRestApiMsdk(Tap):
     ).to_dict()
 
     def discover_streams(self) -> List:
-        """Create stream instances from config['streams']."""
         cfg_streams: List[Dict[str, Any]] = self.config.get("streams", [])
         streams: List = []
 
         for s in cfg_streams:
-            name = s["name"]
-            path = s["path"]
-            records_path = s.get("records_path")
-            primary_keys = s.get("primary_keys", [])
-            replication_key = s.get("replication_key")  # may be None
-            next_page_token_path = s.get("next_page_token_path")
-            params = s.get("params", {}) or {}
-            iteration_config = s.get("iteration_config", {}) or {}
-            pagination_results_limit = s.get("pagination_results_limit")
-
             common_kwargs = dict(
                 tap=self,
-                name=name,
-                path=path,
-                records_path=records_path,
-                primary_keys=primary_keys,
-                replication_key=replication_key,
-                next_page_token_path=next_page_token_path,
-                params=params,
-                iteration_config=iteration_config,
-                pagination_results_limit=pagination_results_limit,
+                name=s["name"],
+                path=s["path"],
+                records_path=s.get("records_path"),
+                primary_keys=s.get("primary_keys", []),
+                replication_key=s.get("replication_key"),
+                next_page_token_path=s.get("next_page_token_path"),
+                params=s.get("params", {}) or {},
+                iteration_config=s.get("iteration_config", {}) or {},
+                pagination_results_limit=s.get("pagination_results_limit"),
             )
 
+            path = s["path"]
             if path == "/twitter/user/info":
                 streams.append(TwitterUsersStream(**common_kwargs))
             elif path == "/twitter/user/mentions":
@@ -74,7 +59,6 @@ class TapRestApiMsdk(Tap):
             elif path == "/twitter/tweet/advanced_search":
                 streams.append(TwitterAdvancedSearchStream(**common_kwargs))
             else:
-                # Fallback to advanced search behavior (same paginator/shape)
                 streams.append(TwitterAdvancedSearchStream(**common_kwargs))
 
         return streams
