@@ -1,335 +1,477 @@
-from __future__ import annotations
+"""Generic REST stream with run budget, dupes guard, iteration, field pruning, and rich logging."""
 
-import datetime as dt
-import re
-from typing import Any, Dict, Iterable, List, Optional
+import email.utils
+import json
+from datetime import datetime
+from string import Template
+from typing import Any, Dict, Generator, Iterable, Optional, Union
+from urllib.parse import parse_qs, parse_qsl, urlparse
 
 import requests
-from singer_sdk import typing as th
-from singer_sdk.helpers._typing import TypeConformanceLevel
+from singer_sdk.helpers import types
 from singer_sdk.helpers.jsonpath import extract_jsonpath
-from singer_sdk.streams import RESTStream
+from singer_sdk.pagination import (
+    BaseHATEOASPaginator,
+    HeaderLinkPaginator,
+    JSONPathPaginator,
+    SimpleHeaderPaginator,
+    SinglePagePaginator,
+)
 
-TWITTER_DATE_FMT = "%a %b %d %H:%M:%S %z %Y"  # e.g. Tue Dec 10 07:00:30 +0000 2024
-
-
-def parse_created_at_to_epoch(val: Optional[str]) -> Optional[int]:
-    if not val or not isinstance(val, str):
-        return None
-    try:
-        return int(dt.datetime.strptime(val, TWITTER_DATE_FMT).timestamp())
-    except Exception:
-        return None
-
-
-def iso_start_to_epoch(val: Optional[str]) -> Optional[int]:
-    if not val:
-        return None
-    try:
-        s = val.replace("Z", "+00:00")
-        return int(dt.datetime.fromisoformat(s).timestamp())
-    except Exception:
-        return None
+from tap_rest_api_msdk.client import RestApiStream
+from tap_rest_api_msdk.pagination import (
+    RestAPIBasePageNumberPaginator,
+    RestAPIHeaderLinkPaginator,
+    RestAPIOffsetPaginator,
+    SimpleOffsetPaginator,
+)
+from tap_rest_api_msdk.utils import flatten_json, get_start_date
 
 
-def epoch_to_since_utc(epoch: int) -> str:
-    return dt.datetime.utcfromtimestamp(epoch).strftime("%Y-%m-%d_%H:%M:%S_UTC")
-
-
-def tweet_schema_dict() -> Dict[str, Any]:
-    return th.PropertiesList(
-        th.Property("id", th.StringType),
-        th.Property("url", th.StringType),
-        th.Property("text", th.StringType),
-        th.Property("source", th.StringType),
-        th.Property("retweetCount", th.IntegerType),
-        th.Property("replyCount", th.IntegerType),
-        th.Property("likeCount", th.IntegerType),
-        th.Property("quoteCount", th.IntegerType),
-        th.Property("viewCount", th.IntegerType),
-        th.Property("createdAt", th.StringType),  # replication key
-        th.Property("lang", th.StringType),
-        th.Property("bookmarkCount", th.IntegerType),
-        th.Property("isReply", th.BooleanType),
-        th.Property("inReplyToId", th.StringType),
-        th.Property("conversationId", th.StringType),
-        th.Property("displayTextRange", th.ArrayType(th.IntegerType)),
-        th.Property("inReplyToUserId", th.StringType),
-        th.Property("inReplyToUsername", th.StringType),
-        th.Property("author", th.ObjectType()),
-        th.Property("entities", th.ObjectType()),
-        # Use JSON-Schema unions for nullable objects (SDK-agnostic):
-        th.Property("quoted_tweet", th.CustomType({"type": ["object", "null"]})),
-        th.Property("retweeted_tweet", th.CustomType({"type": ["object", "null"]})),
-        # Metadata
-        th.Property("_source_handle", th.StringType),
-        th.Property("_source_keyword", th.StringType),
-        th.Property("_source_hashtag", th.StringType),
-        th.Property("_iteration_type", th.StringType),
-        th.Property("_raw_message", th.CustomType({"type": ["object", "array", "null"]})),
-    ).to_dict()
-
-
-def user_schema_dict() -> Dict[str, Any]:
-    return th.PropertiesList(
-        th.Property("id", th.StringType),
-        th.Property("userName", th.StringType),
-        th.Property("url", th.StringType),
-        th.Property("name", th.StringType),
-        th.Property("isBlueVerified", th.BooleanType),
-        th.Property("verifiedType", th.StringType),
-        th.Property("profilePicture", th.StringType),
-        th.Property("coverPicture", th.StringType),
-        th.Property("description", th.StringType),
-        th.Property("location", th.StringType),
-        th.Property("followers", th.IntegerType),
-        th.Property("following", th.IntegerType),
-        th.Property("canDm", th.BooleanType),
-        th.Property("createdAt", th.StringType),
-        th.Property("favouritesCount", th.IntegerType),
-        th.Property("hasCustomTimelines", th.BooleanType),
-        th.Property("isTranslator", th.BooleanType),
-        th.Property("mediaCount", th.IntegerType),
-        th.Property("statusesCount", th.IntegerType),
-        th.Property("withheldInCountries", th.ArrayType(th.StringType)),
-        th.Property("affiliatesHighlightedLabel", th.ObjectType()),
-        th.Property("possiblySensitive", th.BooleanType),
-        th.Property("pinnedTweetIds", th.ArrayType(th.StringType)),
-        th.Property("isAutomated", th.BooleanType),
-        th.Property("automatedBy", th.StringType),
-        th.Property("unavailable", th.BooleanType),
-        th.Property("message", th.StringType),
-        th.Property("unavailableReason", th.StringType),
-        th.Property("profile_bio", th.ObjectType()),
-        # Metadata
-        th.Property("_source_handle", th.StringType),
-        th.Property("_iteration_type", th.StringType),
-    ).to_dict()
-
-
-class BaseTwitterStream(RESTStream):
-    TYPE_CONFORMANCE_LEVEL = TypeConformanceLevel.NONE
-
-    path: str
-    records_path: Optional[str] = None
-    next_page_token_jsonpath: Optional[str] = None
-    primary_keys: List[str] = []
-    replication_key: Optional[str] = None
-    iteration_config: Dict[str, Any] = {}
-    pagination_results_limit: Optional[int] = None
-
+class DynamicStream(RestApiStream):
     def __init__(
         self,
-        tap,
+        tap: Any,
         name: str,
+        records_path: str,
         path: str,
-        records_path: Optional[str],
-        primary_keys: List[str],
-        replication_key: Optional[str],
-        next_page_token_path: Optional[str],
-        params: Dict[str, Any],
-        iteration_config: Dict[str, Any],
-        pagination_results_limit: Optional[int],
-    ):
-        # Build schema first for discovery
-        schema = user_schema_dict() if path == "/twitter/user/info" else tweet_schema_dict()
-
-        # Optional per-stream overrides
-        overrides_all = tap.config.get("schema_overrides") or {}
-        overrides = overrides_all.get(name) or {}
-        if isinstance(overrides.get("properties"), dict):
-            schema.setdefault("properties", {}).update(overrides["properties"])
-
+        params: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        primary_keys: Optional[list] = None,
+        replication_key: Optional[str] = None,
+        except_keys: Optional[list] = None,
+        next_page_token_path: Optional[str] = None,
+        schema: Optional[dict] = None,
+        pagination_request_style: str = "default",
+        pagination_response_style: str = "default",
+        pagination_page_size: Optional[int] = None,
+        pagination_results_limit: Optional[int] = None,
+        pagination_next_page_param: Optional[str] = None,
+        pagination_limit_per_page_param: Optional[str] = None,
+        pagination_total_limit_param: Optional[str] = None,
+        pagination_initial_offset: int = 1,
+        offset_records_jsonpath: Optional[str] = None,
+        start_date: Optional[datetime] = None,
+        source_search_field: Optional[str] = None,
+        source_search_query: Optional[str] = None,
+        use_request_body_not_params: Optional[bool] = False,
+        backoff_type: Optional[str] = None,
+        backoff_param: Optional[str] = "Retry-After",
+        backoff_time_extension: Optional[int] = 0,
+        store_raw_json_message: Optional[bool] = False,
+        authenticator: Optional[object] = None,
+        # NEW:
+        iteration_config: Optional[dict] = None,
+        keep_fields: Optional[list] = None,
+        bookmark_target_param: Optional[str] = None,
+        bookmark_query_template: Optional[str] = None,
+    ) -> None:
+        # IMPORTANT: stream name must be the stream's name (not tap name)
         super().__init__(tap=tap, name=name, schema=schema)
 
+        self.name = name
         self.path = path
-        self.records_path = records_path
+        self.params = params or {}
+        self.headers = headers
+        self.assigned_authenticator = authenticator
+        self._authenticator = authenticator
         self.primary_keys = primary_keys or []
         self.replication_key = replication_key
-        self.next_page_token_jsonpath = next_page_token_path
-        self._base_params = params or {}
+        self.except_keys = except_keys
+        self.records_path = records_path
+
+        # iteration support
         self.iteration_config = iteration_config or {}
+        self.keep_fields = keep_fields or []
+        self.bookmark_target_param = bookmark_target_param
+        self.bookmark_query_template = bookmark_query_template
+
+        # page tokens
+        if next_page_token_path:
+            self.next_page_token_jsonpath = next_page_token_path
+        elif pagination_request_style in {"jsonpath_paginator", "default"}:
+            self.next_page_token_jsonpath = "$.next_page"
+
+        # param strategy
+        get_param_styles = {
+            "style1": self._get_url_params_offset_style,
+            "offset": self._get_url_params_offset_style,
+            "page": self._get_url_params_page_style,
+            "header_link": self._get_url_params_header_link,
+            "hateoas_body": self._get_url_params_hateoas_body,
+        }
+        self.use_request_body_not_params = use_request_body_not_params
+        self.backoff_type = backoff_type
+        self.backoff_param = backoff_param
+        self.backoff_time_extension = backoff_time_extension
+        self.store_raw_json_message = store_raw_json_message
+        if self.use_request_body_not_params:
+            self.prepare_request_payload = get_param_styles.get(  # type: ignore
+                pagination_response_style, self._get_url_params_page_style
+            )
+        else:
+            self.get_url_params = get_param_styles.get(  # type: ignore
+                pagination_response_style, self._get_url_params_page_style
+            )
+
+        # pagination config
+        self.pagination_request_style = pagination_request_style
         self.pagination_results_limit = pagination_results_limit
+        self.pagination_next_page_param = pagination_next_page_param
+        self.pagination_limit_per_page_param = pagination_limit_per_page_param
+        self.pagination_total_limit_param = pagination_total_limit_param
+        self.start_date = start_date
+        self.source_search_field = source_search_field
+        self.source_search_query = source_search_query
+        self.pagination_initial_offset = pagination_initial_offset
+        self.offset_records_jsonpath = offset_records_jsonpath
 
-        self._http_request_count = 0
-        self._emitted_total = 0
+        # compute page size
+        if self.pagination_request_style == "restapi_header_link_paginator":
+            page_limit_param = self.pagination_limit_per_page_param or "per_page"
+            self.pagination_page_size = int((pagination_page_size or self.params.get(page_limit_param, 25)))
+        elif self.pagination_request_style in {"style1", "offset_paginator"}:
+            if self.pagination_results_limit:
+                self.ABORT_AT_RECORD_COUNT = self.pagination_results_limit
+            page_limit_param = self.pagination_limit_per_page_param or "limit"
+            self.pagination_page_size = int((pagination_page_size or self.params.get(page_limit_param, 25)))
+        else:
+            if self.pagination_results_limit:
+                self.ABORT_AT_RECORD_COUNT = self.pagination_results_limit
+            self.pagination_page_size = pagination_page_size
+
+        # GitHub-only behavior retained but disabled by default
+        self.use_fake_since_parameter = False
+
+        # run budget & duplicate guard
+        self._max_total = int(self.config.get("max_records_total") or 5000)
         self._max_per_stream = int(self.config.get("max_records_per_stream") or 0) or None
-        self._max_total = int(self.config.get("max_records_total") or 0) or None
+        self._drop_on_bookmark_le = bool(self.config.get("drop_on_bookmark_le", True))
+        self._log_body_preview = int(self.config.get("log_response_body_preview") or 1000)
 
+        self._emitted_total = 0
+
+    # ---------- Iteration: run once per value ----------
+    def sync(self, context: Optional[dict] = None) -> None:
+        it = self.iteration_config or {}
+        values = it.get("values") or [None]
+        for val in values:
+            part_ctx = dict(context or {})
+            part_ctx.update({"iteration_value": val, "iteration_type": it.get("iteration_type")})
+            super().sync(context=part_ctx)
+
+    # ---------- HTTP ----------
     @property
-    def url_base(self) -> str:
-        return self.config["api_url"].rstrip("/")
+    def http_headers(self) -> dict:
+        headers = {}
+        if "user_agent" in self.config:
+            headers["User-Agent"] = self.config.get("user_agent")
+        if self.headers:
+            headers.update(self.headers)
+        return headers
 
-    @property
-    def http_headers(self) -> Dict[str, Any]:
-        hdrs = dict(self.config.get("headers") or {})
-        hdrs.update(self.config.get("api_keys") or {})  # e.g. {"X-API-Key": "..."}
-        return hdrs
+    def backoff_wait_generator(self) -> Generator[Union[int, float], None, None]:
+        def _header_delay(exc):
+            return int(exc.response.headers.get(self.backoff_param, 0)) + self.backoff_time_extension
 
-    def get_next_page_token(self, response: requests.Response, previous_token: Optional[str]) -> Optional[str]:
-        body = response.json() or {}
-        if self.next_page_token_jsonpath:
-            matches = list(extract_jsonpath(self.next_page_token_jsonpath, body))
-            return matches[0] if matches else None
-        return body.get("next_cursor")
+        def _message_delay(exc):
+            msg = exc.response.json().get("message", "")
+            nums = [int(i) for i in str(msg).split() if str(i).isdigit()]
+            return (max(nums) if nums else 0) + self.backoff_time_extension
 
-    def _partition_bookmark_epoch(self, context: Optional[dict]) -> Optional[int]:
-        if not self.replication_key:
-            return None
-        state = self.get_context_state(context) or {}
-        prior_raw = state.get("replication_key_value")
-        if prior_raw:
-            ep = parse_created_at_to_epoch(prior_raw)
-            if ep is not None:
-                return ep
-        return iso_start_to_epoch(self.config.get("start_date"))
+        if self.backoff_type == "message":
+            return self.backoff_runtime(value=_message_delay)
+        if self.backoff_type == "header":
+            return self.backoff_runtime(value=_header_delay)
+        return super().backoff_wait_generator()
 
-    def get_url_params(self, context: Optional[dict], next_page_token: Optional[str]) -> Dict[str, Any]:
-        params = dict(self._base_params)
+    # ---------- Pagination ----------
+    def get_new_paginator(self):
+        self.logger.info(
+            "Paginator=%s jsonpath=%s", self.pagination_request_style, getattr(self, "next_page_token_jsonpath", None)
+        )
+        prs = self.pagination_request_style
+        if prs in {"jsonpath_paginator", "default"}:
+            return JSONPathPaginator(self.next_page_token_jsonpath)
+        if prs == "simple_header_paginator":
+            return JSONPathPaginator(self.next_page_token_jsonpath) if self.next_page_token_jsonpath else SimpleHeaderPaginator("X-Next-Page")
+        if prs == "header_link_paginator":
+            return HeaderLinkPaginator()
+        if prs == "restapi_header_link_paginator":
+            return RestAPIHeaderLinkPaginator(
+                pagination_page_size=self.pagination_page_size,
+                pagination_results_limit=self.pagination_results_limit,
+                replication_key=self.replication_key,
+            )
+        if prs in {"style1", "offset_paginator"}:
+            return RestAPIOffsetPaginator(
+                start_value=self.pagination_initial_offset,
+                page_size=self.pagination_page_size,
+                jsonpath=self.next_page_token_jsonpath,
+                pagination_total_limit_param=self.pagination_total_limit_param,
+            )
+        if prs == "hateoas_paginator":
+            return BaseHATEOASPaginator()
+        if prs == "single_page_paginator":
+            return SinglePagePaginator()
+        if prs == "page_number_paginator":
+            return RestAPIBasePageNumberPaginator(
+                start_value=self.pagination_initial_offset, jsonpath=self.next_page_token_jsonpath
+            )
+        if prs == "simple_offset_paginator":
+            return SimpleOffsetPaginator(
+                start_value=self.pagination_initial_offset,
+                page_size=self.pagination_page_size,
+                offset_records_jsonpath=self.offset_records_jsonpath,
+                pagination_page_size=self.pagination_page_size,
+            )
+        self.logger.error("Unknown paginator '%s'.", prs)
+        raise ValueError(f"Unknown paginator {prs}.")
+
+    # ---------- URL Param Builders ----------
+    def _inject_iteration_params(self, params: Dict[str, Any], context: Optional[dict]) -> None:
+        it = self.iteration_config or {}
+        key = it.get("api_param_key")
+        templ = it.get("api_param_template")
+        if key and templ and context and "iteration_value" in context:
+            params[key] = templ.format(value=context["iteration_value"])
+
+    @staticmethod
+    def _fmt_twitter_since(last_run_date: str) -> str:
+        # Expecting 'YYYY-mm-ddTHH:MM:SS' or RFC; convert to 'YYYY-mm-dd_HH:MM:SS_UTC'
+        try:
+            dtobj = datetime.fromisoformat(str(last_run_date).replace("Z", "+00:00"))
+        except Exception:
+            try:
+                dtobj = email.utils.parsedate_to_datetime(str(last_run_date))
+            except Exception:
+                return str(last_run_date)
+        return dtobj.strftime("%Y-%m-%d_%H:%M:%S_UTC")
+
+    def _inject_bookmark_template(self, params: Dict[str, Any], context: Optional[dict]) -> None:
+        if not (self.bookmark_target_param and self.bookmark_query_template and self.replication_key):
+            return
+        last_run_date = get_start_date(self, context)
+        if not last_run_date:
+            return
+        existing = params.get(self.bookmark_target_param, "")
+        params[self.bookmark_target_param] = Template(self.bookmark_query_template).safe_substitute(
+            existing=str(existing),
+            last_run_date=str(last_run_date),
+            last_run_date_utc_twitter=self._fmt_twitter_since(last_run_date),
+        )
+
+    def _get_url_params_page_style(self, context: Optional[dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
+        last_run_date = get_start_date(self, context)
+        params: dict = dict(self.params or {})
+
         if next_page_token:
-            params["cursor"] = next_page_token
+            params[self.pagination_next_page_param or "page"] = next_page_token
 
-        iter_cfg = self.iteration_config or {}
-        api_param_key = iter_cfg.get("api_param_key")
-        if api_param_key and context and "iteration_value" in context:
-            templ = iter_cfg.get("api_param_template", "{value}")
-            params[api_param_key] = templ.format(value=context["iteration_value"])
+        self._inject_iteration_params(params, context)
 
-        if self.path == "/twitter/tweet/advanced_search":
-            mark_epoch = self._partition_bookmark_epoch(context)
-            if mark_epoch is not None:
-                since_utc = epoch_to_since_utc(mark_epoch)
-                q = params.get("query", "")
-                q = re.sub(r"\s+since:\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2}_UTC", "", q).strip()
-                params["query"] = (q + f" since:{since_utc}").strip()
+        if self.replication_key:
+            if self.source_search_field and self.source_search_query and last_run_date:
+                q = Template(self.source_search_query)
+                params[self.source_search_field] = q.substitute(last_run_date=last_run_date)
+            else:
+                params.setdefault("sort", "asc")
+                params.setdefault("order_by", self.replication_key)
 
-        if self.path == "/twitter/user/mentions":
-            mark_epoch = self._partition_bookmark_epoch(context)
-            if mark_epoch is not None:
-                params["sinceTime"] = int(mark_epoch + 1)  # skip boundary
-
+        self._inject_bookmark_template(params, context)
         return params
 
-    def prepare_request(self, context: Optional[dict], next_page_token: Optional[str]) -> requests.PreparedRequest:
-        req = requests.Request(
-            method="GET",
-            url=f"{self.url_base}{self.path}",
-            headers=self.http_headers,
-            params=self.get_url_params(context, next_page_token),
-        )
-        return req.prepare()
+    def _get_url_params_offset_style(self, context: Optional[dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
+        last_run_date = get_start_date(self, context)
+        params: dict = dict(self.params or {})
 
+        if next_page_token:
+            params[self.pagination_next_page_param or "offset"] = next_page_token
+
+        if self.pagination_page_size is not None:
+            params[self.pagination_limit_per_page_param or "limit"] = self.pagination_page_size
+
+        self._inject_iteration_params(params, context)
+
+        if self.replication_key:
+            if self.source_search_field and self.source_search_query and last_run_date:
+                q = Template(self.source_search_query)
+                params[self.source_search_field] = q.substitute(last_run_date=last_run_date)
+            else:
+                params.setdefault("sort", "asc")
+                params.setdefault("order_by", self.replication_key)
+
+        self._inject_bookmark_template(params, context)
+        return params
+
+    def _get_url_params_header_link(self, context: Optional[Dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
+        params: dict = dict(self.params or {})
+        params[self.pagination_limit_per_page_param or "per_page"] = self.pagination_page_size or 25
+
+        if next_page_token:
+            for k, v in parse_qs(str(next_page_token)).items():
+                params[k] = v
+
+        self._inject_iteration_params(params, context)
+
+        if self.replication_key == "updated_at":
+            params["sort"] = "updated"
+            params["direction"] = "desc" if self.use_fake_since_parameter else "asc"
+        elif self.replication_key in ["starred_at", "created_at"]:
+            params["sort"] = "created"
+            params["direction"] = "desc"
+        elif self.replication_key == "commit_timestamp":
+            params["direction"] = "desc"
+
+        self._inject_bookmark_template(params, context)
+        return params
+
+    def _get_url_params_hateoas_body(self, context: Optional[dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
+        last_run_date = get_start_date(self, context)
+        params: dict = dict(self.params or {})
+
+        if self.pagination_page_size and self.pagination_limit_per_page_param:
+            params[self.pagination_limit_per_page_param] = self.pagination_page_size
+
+        if next_page_token:
+            url_parsed = urlparse(next_page_token)
+            params.update(parse_qsl(url_parsed.query or url_parsed.path))
+            self.path = "" if url_parsed.path == next_page_token else url_parsed.path
+        elif self.replication_key:
+            if self.source_search_field and self.source_search_query and last_run_date:
+                q = Template(self.source_search_query)
+                params[self.source_search_field] = q.substitute(last_run_date=last_run_date)
+
+        self._inject_iteration_params(params, context)
+        self._inject_bookmark_template(params, context)
+        return params
+
+    # ---------- Response / errors ----------
     def validate_response(self, response: requests.Response) -> None:
+        if response.ok:
+            try:
+                body = response.json()
+                if isinstance(body, dict) and str(body.get("status", "")).lower() == "error":
+                    preview = json.dumps(body)[: self._log_body_preview]
+                    self.logger.error(
+                        "API business error: path=%s url=%s req_headers=%s params/body=%s body~=%s",
+                        self.path,
+                        response.request.url,
+                        dict(response.request.headers or {}),
+                        getattr(response.request, "body", None),
+                        preview,
+                    )
+                    response.raise_for_status()
+            except Exception:
+                pass
+            return
+
+        try:
+            raw = response.text
+        except Exception:
+            raw = "<unreadable>"
+        preview = (raw or "")[: self._log_body_preview]
+        self.logger.error(
+            "HTTP error %s %s | path=%s | url=%s | req_headers=%s | params/body=%s | resp_preview=%s",
+            response.status_code,
+            response.reason,
+            self.path,
+            getattr(response.request, "url", ""),
+            dict(getattr(response.request, "headers", {}) or {}),
+            getattr(response.request, "body", None),
+            preview,
+        )
         response.raise_for_status()
 
     def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        body = response.json() or {}
-        self._http_request_count += 1
-        if self.records_path:
-            for rec in extract_jsonpath(self.records_path, body):
-                yield rec
-        else:
-            yield body
+        yield from extract_jsonpath(self.records_path, input=response.json())
+
+    # ---------- Budget + de-dupe + field pruning ----------
+    def _compare_replication_values(self, left: Any, right: Any) -> Optional[int]:
+        if left is None or right is None:
+            return None
+        # try ISO/RFC datetimes
+        for fn in (self._parse_iso_datetime, self._parse_rfc_datetime, self._parse_epoch):
+            try:
+                l = fn(left)
+                r = fn(right)
+                if l is not None and r is not None:
+                    return -1 if l < r else (1 if l > r else 0)
+            except Exception:
+                pass
+        # fallback lexicographic
+        try:
+            l, r = str(left), str(right)
+            return -1 if l < r else (1 if l > r else 0)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_iso_datetime(v: Any) -> Optional[datetime]:
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_rfc_datetime(v: Any) -> Optional[datetime]:
+        try:
+            return email.utils.parsedate_to_datetime(str(v))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_epoch(v: Any) -> Optional[datetime]:
+        try:
+            iv = int(v)
+            if iv > 10_000_000_000:
+                iv = iv / 1000.0
+            return datetime.utcfromtimestamp(iv)
+        except Exception:
+            return None
 
     def _can_emit_more(self) -> bool:
-        if self._max_per_stream is not None and self._emitted_total >= self._max_per_stream:
+        g = getattr(self._tap, "_global_emitted_total", 0)
+        if self._max_total is not None and g >= self._max_total:
             return False
-        global_emitted = getattr(self._tap, "_global_emitted_total", 0)
-        if self._max_total is not None and global_emitted >= self._max_total:
+        if self._max_per_stream is not None and self._emitted_total >= self._max_per_stream:
             return False
         return True
 
     def _increment_emitted(self, n: int = 1) -> None:
         self._emitted_total += n
-        setattr(self._tap, "_global_emitted_total", getattr(self._tap, "_global_emitted_total", 0) + n)
+        prev = getattr(self._tap, "_global_emitted_total", 0)
+        setattr(self._tap, "_global_emitted_total", prev + n)
 
-    def _should_stop_on_bookmark(self, record: dict, context: Optional[dict]) -> bool:
-        if self.path != "/twitter/user/last_tweets" or not self.replication_key:
-            return False
-        prior_epoch = self._partition_bookmark_epoch(context)
-        if prior_epoch is None:
-            return False
-        now_epoch = parse_created_at_to_epoch(record.get(self.replication_key))
-        return (now_epoch is not None) and (now_epoch <= prior_epoch)
+    def post_process(self, row: types.Record, context: Optional[types.Context] = None) -> Optional[dict]:
+        if not self._can_emit_more():
+            return None
 
-    def request_records(self, context: Optional[dict]) -> Iterable[dict]:
-        page_count = 0
-        token: Optional[str] = None
+        # drop duplicates at/before bookmark
+        if self.replication_key and self._drop_on_bookmark_le:
+            bookmark_val = self.get_starting_replication_key_value(context)
+            if bookmark_val is not None:
+                row_val = row.get(self.replication_key)
+                cmp = self._compare_replication_values(row_val, bookmark_val)
+                if cmp is not None and cmp <= 0:
+                    return None
 
-        while True:
-            if not self._can_emit_more():
-                return
+        # stamp iteration metadata, if requested
+        meta_key = (self.iteration_config or {}).get("metadata_key")
+        if meta_key and context and "iteration_value" in context:
+            row[meta_key] = context["iteration_value"]
 
-            resp = self.requests_session.send(self.prepare_request(context, token), timeout=30)
-            self.validate_response(resp)
+        # flatten
+        out = flatten_json(row, self.except_keys, self.store_raw_json_message)
 
-            emitted_this_page = 0
-            stop_early = False
+        # field pruning
+        if self.keep_fields:
+            must_keep = set(self.keep_fields) | set(self.primary_keys or [])
+            if self.replication_key:
+                must_keep.add(self.replication_key)
+            if meta_key:
+                must_keep.add(meta_key)
+            out = {k: v for k, v in out.items() if k in must_keep}
 
-            for rec in self.parse_response(resp):
-                if self._should_stop_on_bookmark(rec, context):
-                    stop_early = True
-                    break
-                if not self._can_emit_more():
-                    stop_early = True
-                    break
-
-                meta_key = (self.iteration_config or {}).get("metadata_key")
-                iter_type = (self.iteration_config or {}).get("iteration_type")
-                if meta_key and context and "iteration_value" in context:
-                    rec[meta_key] = context["iteration_value"]
-                if iter_type:
-                    rec["_iteration_type"] = iter_type
-
-                if self.config.get("store_raw_json_message"):
-                    rec.setdefault("_raw_message", rec)
-
-                yield rec
-                self._increment_emitted(1)
-                emitted_this_page += 1
-
-            page_count += 1
-            if stop_early:
-                return
-
-            if self.pagination_results_limit is not None and page_count >= int(self.pagination_results_limit):
-                return
-
-            token = self.get_next_page_token(resp, token)
-            if not token:
-                return
-
-    def sync(self, context: Optional[dict] = None) -> None:
-        iter_cfg = self.iteration_config or {}
-        values = iter_cfg.get("values") or [None]
-        for val in values:
-            part_ctx = {"iteration_value": val, "iteration_type": iter_cfg.get("iteration_type")}
-            super().sync(context=part_ctx)
-
-
-class TwitterAdvancedSearchStream(BaseTwitterStream):
-    path = "/twitter/tweet/advanced_search"
-    records_path = "$.tweets[*]"
-    primary_keys = ["id"]
-    replication_key = "createdAt"
-
-
-class TwitterMentionsStream(BaseTwitterStream):
-    path = "/twitter/user/mentions"
-    records_path = "$.tweets[*]"
-    primary_keys = ["id"]
-    replication_key = "createdAt"
-
-
-class TwitterLatestStream(BaseTwitterStream):
-    path = "/twitter/user/last_tweets"
-    records_path = "$.tweets[*]"
-    primary_keys = ["id"]
-    replication_key = "createdAt"
-
-
-class TwitterUsersStream(BaseTwitterStream):
-    path = "/twitter/user/info"
-    records_path = "$.data"
-    primary_keys = ["id"]
-    replication_key = None
+        self._increment_emitted(1)
+        return out
