@@ -1,70 +1,70 @@
-"""REST client handling, including RestApiStream base class."""
+"""REST client base stream."""
+
+from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
-import json
-import urllib.parse
+from typing import Any, Dict, Optional
 
 from singer_sdk.streams import RESTStream
 from tap_rest_api_msdk.auth import get_authenticator
 
-SCHEMAS_DIR = Path(__file__).parent / Path("./schemas")
+SCHEMAS_DIR = Path(__file__).parent / "schemas"
 
 
 class RestApiStream(RESTStream):
-    """rest-api stream class."""
+    """Generic RESTStream with unified auth handling and soft-fail support."""
 
-    def __init__(self, *args, **kwargs):
+    # Populated from tap config at runtime
+    soft_fail_status_codes: Optional[list[int]] = None
+    request_timeout_secs: Optional[int] = None
+
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.http_auth = None
         self._authenticator = getattr(self, "assigned_authenticator", None)
 
-        # new: soft-fail & logging controls (config-based)
+        # pull soft-fail and timeout from tap config, if set
         cfg = getattr(self, "config", {}) or {}
-        self._soft_fail_status_codes = set(cfg.get("soft_fail_status_codes") or [400, 404, 422])
-        self._log_body_preview = int(cfg.get("log_response_body_preview") or 1000)
+        self.soft_fail_status_codes = cfg.get("soft_fail_status_codes") or []
+        self.request_timeout_secs = cfg.get("request_timeout_secs") or None
 
     @property
-    def url_base(self) -> Any:
-        return self.config["api_url"]
+    def url_base(self) -> str:
+        base = self.config["api_url"]
+        return base[:-1] if base.endswith("/") else base
 
     @property
     def authenticator(self) -> Any:
-        get_authenticator(self)
-        return self._authenticator
+        # Lazily create/authenticate as needed
+        return get_authenticator(self)
 
-    # NEW: friendlier error handler that can soft-fail certain codes
+    def prepare_request_kwargs(self, context: Optional[dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
+        kwargs = super().prepare_request_kwargs(context, next_page_token)
+        if self.request_timeout_secs:
+            kwargs["timeout"] = float(self.request_timeout_secs)
+        return kwargs
+
     def validate_response(self, response) -> None:
-        if response.ok:
+        if self.soft_fail_status_codes and response.status_code in self.soft_fail_status_codes:
+            self.logger.warning(
+                "Soft-failing response: %s %s -> %s (%s)",
+                response.request.method,
+                response.request.url,
+                response.status_code,
+                (response.text or "")[:500],
+            )
+            # Raise StopIteration for this page to be treated as empty by SDK.
+            # We do this by returning without raising; parse_response should yield nothing.
             return
-        # preview request context
         try:
-            req = response.request
-            full_url = req.url
-            method = req.method
-            # log parsed query (helps find missing required params)
-            parsed = urllib.parse.urlparse(full_url)
-            q = urllib.parse.parse_qs(parsed.query)
+            response.raise_for_status()
         except Exception:
-            full_url, method, q = ("<unknown>", "<unknown>", {})
-
-        # preview body
-        try:
-            body_preview = response.text[: self._log_body_preview]
-        except Exception:
-            body_preview = "<non-text-response>"
-
-        msg = (
-            f"[{self.name}] HTTP {response.status_code} on {method} {full_url} "
-            f"params={q} body~{self._log_body_preview}='{body_preview}'"
-        )
-
-        if response.status_code in self._soft_fail_status_codes:
-            self.logger.warning("Soft-failing stream due to non-critical error: " + msg)
-            # Treat as empty page: downstream code will emit nothing for this page/partition
-            # by skipping parse/iteration when we return without raising.
-            return
-
-        # hard fail for everything else
-        self.logger.error("Hard error: " + msg)
-        response.raise_for_status()
+            # emit rich context for troubleshooting
+            self.logger.exception(
+                "HTTP error for %s %s -> %s. Body(head): %s",
+                response.request.method,
+                response.request.url,
+                response.status_code,
+                (response.text or "")[:1000],
+            )
+            raise
