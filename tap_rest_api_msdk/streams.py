@@ -383,8 +383,21 @@ class DynamicStream(RestApiStream):
         )
         response.raise_for_status()
 
-    def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        yield from extract_jsonpath(self.records_path, input=response.json())
+        def parse_response(self, response: requests.Response) -> Iterable[dict]:
+            """Parse the response and return an iterator of result rows."""
+            # If validate_response soft-failed, response might still be non-OK; return no rows.
+            if not response.ok and response.status_code:  # non-OK but soft-failed path
+                return []
+            try:
+                data = response.json()
+            except Exception as ex:
+                self.logger.error(
+                    f"[{self.name}] Failed to parse JSON: {ex}. "
+                    f"Status={response.status_code} text~1000='{response.text[:1000]}'"
+                )
+                return []
+            # normal path
+            yield from extract_jsonpath(self.records_path, input=data)
 
     # ---------- Budget + de-dupe + field pruning ----------
     def _compare_replication_values(self, left: Any, right: Any) -> Optional[int]:

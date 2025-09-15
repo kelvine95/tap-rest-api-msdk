@@ -1,7 +1,9 @@
 """REST client handling, including RestApiStream base class."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+import json
+import urllib.parse
 
 from singer_sdk.streams import RESTStream
 from tap_rest_api_msdk.auth import get_authenticator
@@ -17,39 +19,52 @@ class RestApiStream(RESTStream):
         self.http_auth = None
         self._authenticator = getattr(self, "assigned_authenticator", None)
 
+        # new: soft-fail & logging controls (config-based)
+        cfg = getattr(self, "config", {}) or {}
+        self._soft_fail_status_codes = set(cfg.get("soft_fail_status_codes") or [400, 404, 422])
+        self._log_body_preview = int(cfg.get("log_response_body_preview") or 1000)
+
     @property
     def url_base(self) -> Any:
-        """Return the API URL root, configurable via tap settings.
-
-        Returns:
-            The base url for the api call.
-
-        """
         return self.config["api_url"]
 
     @property
     def authenticator(self) -> Any:
-        """Call an appropriate SDK Authentication method.
-
-        Calls an appropriate SDK Authentication method based on the the set
-        auth_method which is set via the config.
-        If an authenticator (auth_method) is not specified, REST-based taps will simply
-        pass `http_headers` as defined in the tap and stream classes.
-
-        Note 1: Each auth method requires certain configuration to be present see
-        README.md for each auth methods configuration requirements.
-
-        Note 2: Using Singleton Pattern on the autenticator for caching with a check
-        if an OAuth Token has expired and needs to be refreshed.
-
-        Raises:
-            ValueError: if the auth_method is unknown.
-
-        Returns:
-            A SDK Authenticator or APIAuthenticatorBase if no auth_method supplied.
-
-        """
-        # Obtaining Authenticator for authorisation to extract data.
         get_authenticator(self)
-
         return self._authenticator
+
+    # NEW: friendlier error handler that can soft-fail certain codes
+    def validate_response(self, response) -> None:
+        if response.ok:
+            return
+        # preview request context
+        try:
+            req = response.request
+            full_url = req.url
+            method = req.method
+            # log parsed query (helps find missing required params)
+            parsed = urllib.parse.urlparse(full_url)
+            q = urllib.parse.parse_qs(parsed.query)
+        except Exception:
+            full_url, method, q = ("<unknown>", "<unknown>", {})
+
+        # preview body
+        try:
+            body_preview = response.text[: self._log_body_preview]
+        except Exception:
+            body_preview = "<non-text-response>"
+
+        msg = (
+            f"[{self.name}] HTTP {response.status_code} on {method} {full_url} "
+            f"params={q} body~{self._log_body_preview}='{body_preview}'"
+        )
+
+        if response.status_code in self._soft_fail_status_codes:
+            self.logger.warning("Soft-failing stream due to non-critical error: " + msg)
+            # Treat as empty page: downstream code will emit nothing for this page/partition
+            # by skipping parse/iteration when we return without raising.
+            return
+
+        # hard fail for everything else
+        self.logger.error("Hard error: " + msg)
+        response.raise_for_status()
