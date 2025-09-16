@@ -113,3 +113,4 @@ def get_start_date(self, context: Optional[dict]) -> Any:
         return self.get_starting_timestamp(context).strftime("%Y-%m-%dT%H:%M:%S")
     except (ValueError, AttributeError):
         return self.get_starting_replication_key_value(context)
+    

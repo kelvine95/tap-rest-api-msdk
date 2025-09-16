@@ -1,4 +1,4 @@
-"""rest-api tap class with era-based incremental support."""
+"""rest-api tap class."""
 
 import copy
 import json
@@ -16,10 +16,15 @@ from tap_rest_api_msdk.utils import flatten_json
 
 
 class TapRestApiMsdk(Tap):
-    """rest-api tap class with era-based incremental support."""
+    """rest-api tap class."""
 
     name = "tap-rest-api-msdk"
+
+    # Required for Authentication in tap.py - function APIAuthenticatorBase
     tap_name = name
+
+    # Used to cache the Authenticator to prevent over hitting the Authentication
+    # end-point for each stream.
     _authenticator: Optional[APIAuthenticatorBase] = None
 
     common_properties = th.PropertiesList(
@@ -128,49 +133,6 @@ class TapRestApiMsdk(Tap):
             '{ "meta.lastUpdated": { "gt": "$last_run_date" }}}] }} .'
             "Note: Any required double quotes in the query template must "
             "be escaped.",
-        ),
-        # Era-based incremental properties
-        th.Property(
-            "era_based_incremental",
-            th.BooleanType,
-            default=False,
-            required=False,
-            description="Enable era-based incremental sync for APIs that return "
-            "results sorted by era/epoch ID in descending order. This "
-            "mode tracks the highest era processed and stops pagination "
-            "when reaching known data.",
-        ),
-        th.Property(
-            "era_field",
-            th.StringType,
-            default="era_id",
-            required=False,
-            description="The field name containing the era/epoch identifier. "
-            "Defaults to 'era_id'. Used with era_based_incremental.",
-        ),
-        th.Property(
-            "max_pages_per_run",
-            th.IntegerType,
-            default=50,
-            required=False,
-            description="Maximum number of pages to fetch per run when using "
-            "era_based_incremental. Helps respect API rate limits. "
-            "Defaults to 50.",
-        ),
-        th.Property(
-            "initial_sync_era_id",
-            th.IntegerType,
-            required=False,
-            description="Starting era_id for initial sync when using era_based_incremental. "
-            "Records with era_id less than this value will be skipped during initial sync.",
-        ),
-        th.Property(
-            "rate_limit_delay",
-            th.NumberType,
-            default=0.7,
-            required=False,
-            description="Delay in seconds between API requests to respect rate limits. "
-            "Defaults to 0.7 seconds (for ~85 requests/minute).",
         ),
     )
 
@@ -439,6 +401,45 @@ class TapRestApiMsdk(Tap):
             description="Optional jsonpath string representing the path in the results "
             "Defaults to `None`.",
         ),
+        # --- Era-based incremental (optional) ---
+        th.Property(
+            "era_based_incremental",
+            th.BooleanType,
+            default=False,
+            required=False,
+            description="Enable simple era-based incremental using integer era_id. "
+            "When enabled, the tap will send from_era_id and (optionally) to_era_id "
+            "query params. On subsequent runs, it resumes from the last era_id stored "
+            "in state (ignoring any configured from_era_id).",
+        ),
+        th.Property(
+            "era_field",
+            th.StringType,
+            default="era_id",
+            required=False,
+            description="Name of the integer era field in responses. Defaults to 'era_id'.",
+        ),
+        th.Property(
+            "initial_sync_era_id",
+            th.IntegerType,
+            required=False,
+            description="Initial starting era_id (inclusive) for first run. If not set, "
+            "the tap will fall back to any user-supplied from_era_id in params.",
+        ),
+        th.Property(
+            "to_era_id",
+            th.IntegerType,
+            required=False,
+            description="Optional maximum era_id (inclusive). If omitted, the API returns "
+            "up to the most recent era by default.",
+        ),
+        th.Property(
+            "rate_limit_delay",
+            th.NumberType,
+            default=0.0,
+            required=False,
+            description="Optional delay (seconds) between requests to respect API rate limits.",
+        ),
     )
 
     # add common properties to top-level properties
@@ -480,8 +481,15 @@ class TapRestApiMsdk(Tap):
 
     config_jsonschema = top_level_properties.to_dict()
 
-    def discover_streams(self) -> List[DynamicStream]:
-        """Return a list of discovered streams with era-based support."""
+    def discover_streams(self) -> List[DynamicStream]:  # type: ignore
+        """Return a list of discovered streams.
+
+        Returns:
+            A list of streams.
+
+        """
+        # print(self.top_level_properties.to_dict())
+
         streams = []
         for stream in self.config["streams"]:
             # resolve config
@@ -505,28 +513,6 @@ class TapRestApiMsdk(Tap):
             offset_records_jsonpath = stream.get(
                 "offset_records_jsonpath",
                 self.config.get("offset_records_jsonpath", None),
-            )
-            
-            # Era-based incremental settings
-            era_based_incremental = stream.get(
-                "era_based_incremental", 
-                self.config.get("era_based_incremental", False)
-            )
-            era_field = stream.get(
-                "era_field",
-                self.config.get("era_field", "era_id")
-            )
-            max_pages_per_run = stream.get(
-                "max_pages_per_run",
-                self.config.get("max_pages_per_run", 50)
-            )
-            initial_sync_era_id = stream.get(
-                "initial_sync_era_id",
-                self.config.get("initial_sync_era_id", None)
-            )
-            rate_limit_delay = stream.get(
-                "rate_limit_delay",
-                self.config.get("rate_limit_delay", 0.7)
             )
 
             schema = {}
@@ -602,12 +588,6 @@ class TapRestApiMsdk(Tap):
                     backoff_time_extension=self.config.get("backoff_time_extension"),
                     store_raw_json_message=self.config.get("store_raw_json_message"),
                     authenticator=self._authenticator,
-                    # Pass era-based settings
-                    era_based_incremental=era_based_incremental,
-                    era_field=era_field,
-                    max_pages_per_run=max_pages_per_run,
-                    initial_sync_era_id=initial_sync_era_id,
-                    rate_limit_delay=rate_limit_delay,
                 )
             )
 
@@ -622,13 +602,40 @@ class TapRestApiMsdk(Tap):
         params: dict,
         headers: dict,
     ) -> Any:
-        """Infer schema from the first records returned by api."""
+        """Infer schema from the first records returned by api. Creates a Stream object.
+
+        If auth_method is set, will call get_authenticator to obtain credentials
+        to issue a request to sample some records. The get_authenticator will:
+        - stores the authenticator in self._authenticator
+        - sets the self.http_auth if required by a given authenticator
+        - use an existing authenticator if one exists and is cached.
+
+        Args:
+            records_path: required - see config_jsonschema.
+            except_keys: required - see config_jsonschema.
+            inference_records: required - see config_jsonschema.
+            path: required - see config_jsonschema.
+            params: required - see config_jsonschema.
+            headers: required - see config_jsonschema.
+
+        Raises:
+            ValueError: if the response is not valid or a record is not valid json.
+
+        Returns:
+            A schema for the stream.
+
+        """
+        # TODO: this request format is not very robust
+
+        # Initialise Variables
         auth_method = self.config.get("auth_method", "")
         self.http_auth = None
 
         if auth_method and not auth_method == "no_auth":
+            # Obtaining Authenticator for authorisation to obtain a schema.
             get_authenticator(self)
 
+            # Get an initial oauth token if an oauth method
             if auth_method == "oauth" and isinstance(
                 self._authenticator, ConfigurableOAuthAuthenticator
             ):
@@ -661,6 +668,7 @@ class TapRestApiMsdk(Tap):
             )
 
             builder.add_object(flat_record)
+            # Optional add _sdc_raw_json field to store the raw message
             if self.config.get("store_raw_json_message"):
                 builder.add_object({"_sdc_raw_json": {}})
 

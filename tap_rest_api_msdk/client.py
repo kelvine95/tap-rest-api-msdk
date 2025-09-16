@@ -53,3 +53,4 @@ class RestApiStream(RESTStream):
         get_authenticator(self)
 
         return self._authenticator
+    

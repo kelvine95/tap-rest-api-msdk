@@ -1,17 +1,13 @@
-"""Stream type classes for tap-rest-api-msdk with era-based incremental support."""
+"""Stream type classes for tap-rest-api-msdk."""
 
 import email.utils
-import json
-import logging
 import time
+import json
 from datetime import datetime
 from string import Template
 from typing import Any, Dict, Generator, Iterable, Optional, Union
 from urllib.parse import parse_qs, parse_qsl, urlparse
-from singer_sdk.helpers._state import (
-    get_state_if_exists,
-    write_stream_state,
-)
+
 import requests
 from singer_sdk.helpers import types
 from singer_sdk.helpers.jsonpath import extract_jsonpath
@@ -31,69 +27,21 @@ from tap_rest_api_msdk.pagination import (
 )
 from tap_rest_api_msdk.utils import flatten_json, get_start_date
 
-class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
-    """Custom paginator that tracks era_id for incremental sync."""
+# Remove commented section to show http_request for debugging
+# import logging
+# import http.client
 
-    def __init__(self, *args, era_field=None, max_pages_per_run=50, logger=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.era_field = era_field
-        self.max_pages_per_run = max_pages_per_run
-        self.pages_fetched = 0
-        self.stop_pagination = False
-        self.logger = logger or logging.getLogger(self.__class__.__name__)
+# http.client.HTTPConnection.debuglevel = 1
 
-    def has_more(self, response: requests.Response) -> bool:
-        """Return True if there are more pages to fetch."""
-        self.pages_fetched += 1
-
-        # Check if we should stop due to reaching known data
-        if self.stop_pagination:
-            self.logger.info("Stopping pagination - reached known era")
-            return False
-
-        # Respect max pages per run
-        if self.max_pages_per_run and self.pages_fetched >= self.max_pages_per_run:
-            self.logger.info(f"Reached page limit ({self.max_pages_per_run} pages)")
-            return False
-
-        try:
-            payload = response.json() or {}
-        except Exception:
-            self.logger.warning("Response did not contain JSON; stopping.")
-            return False
-
-        # Check if we have any records
-        data = payload.get("data", [])
-        if not data:
-            self.logger.info("No data in response, stopping")
-            return False
-
-        # Get page count info
-        total_pages = payload.get("page_count") or payload.get("pageCount")
-        
-        if total_pages is None:
-            # Try to derive from item_count
-            item_count = payload.get("item_count")
-            page_size = getattr(self, "page_size", None)
-            if item_count is not None and page_size:
-                try:
-                    total_pages = (int(item_count) + int(page_size) - 1) // int(page_size)
-                except Exception:
-                    self.logger.warning("Could not calculate total pages")
-                    return False
-            else:
-                return False
-
-        has_more_pages = self.current_value < total_pages
-        
-        if not has_more_pages:
-            self.logger.info(f"No more pages (current: {self.current_value}, total: {total_pages})")
-        
-        return has_more_pages
+# logging.basicConfig()
+# logging.getLogger().setLevel(logging.DEBUG)
+# requests_log = logging.getLogger("requests.packages.urllib3")
+# requests_log.setLevel(logging.DEBUG)
+# requests_log.propagate = True
 
 
 class DynamicStream(RestApiStream):
-    """Define custom stream with era-based incremental support."""
+    """Define custom stream."""
 
     def __init__(
         self,
@@ -126,15 +74,52 @@ class DynamicStream(RestApiStream):
         backoff_time_extension: Optional[int] = 0,
         store_raw_json_message: Optional[bool] = False,
         authenticator: Optional[object] = None,
-        # Era-based parameters
+        # --- NEW optional args (backward compatible) ---
         era_based_incremental: Optional[bool] = False,
-        era_field: Optional[str] = None,
-        max_pages_per_run: Optional[int] = 50,
+        era_field: Optional[str] = "era_id",
         initial_sync_era_id: Optional[int] = None,
-        rate_limit_delay: Optional[float] = 0.7,
+        to_era_id: Optional[int] = None,
+        rate_limit_delay: Optional[float] = 0.0,
     ) -> None:
-        """Initialize the stream with era-based incremental support."""
-        super().__init__(tap=tap, name=name, schema=schema)
+        """Class initialization.
+
+        Args:
+            tap: see tap.py
+            name: see tap.py
+            path: see tap.py
+            params: see tap.py
+            headers: see tap.py
+            primary_keys: see tap.py
+            replication_key: see tap.py
+            except_keys: see tap.py
+            records_path: see tap.py
+            next_page_token_path: see tap.py
+            schema: the json schema for the stream.
+            pagination_request_style: see tap.py
+            pagination_response_style: see tap.py
+            pagination_page_size: see tap.py
+            pagination_results_limit: see tap.py
+            pagination_next_page_param: see tap.py
+            pagination_limit_per_page_param: see tap.py
+            pagination_total_limit_param: see tap.py
+            pagination_initial_offset: see tap.py
+            start_date: see tap.py
+            source_search_field: see tap.py
+            source_search_query: see tap.py
+            use_request_body_not_params: see tap.py
+            backoff_type: see tap.py
+            backoff_param: see tap.py
+            backoff_time_extension: see tap.py
+            store_raw_json_message: see tap.py
+            authenticator: see tap.py
+            era_based_incremental: optional - enables era_id windowing if True.
+            era_field: optional - the integer field name used as era.
+            initial_sync_era_id: optional - starting era_id for first run (inclusive).
+            to_era_id: optional - maximum era_id (inclusive).
+            rate_limit_delay: optional - sleep seconds between requests.
+
+        """
+        super().__init__(tap=tap, name=tap.name, schema=schema)
 
         if primary_keys is None:
             primary_keys = []
@@ -150,25 +135,15 @@ class DynamicStream(RestApiStream):
         self.except_keys = except_keys
         self.records_path = records_path
 
-        # Era-based incremental settings
-        self.era_based_incremental = era_based_incremental
-        self.era_field = era_field or "era_id"
-        self.max_pages_per_run = max_pages_per_run
-        self.initial_sync_era_id = initial_sync_era_id
-        self.rate_limit_delay = rate_limit_delay
-        
-        # Composite bookmark tracking
-        self._composite_bookmark: Dict[str, Any] = {}
-        self._seen_in_current_run: set = set()
-
-        # Pagination configuration
         if next_page_token_path:
             self.next_page_token_jsonpath = next_page_token_path
         elif (
             pagination_request_style == "jsonpath_paginator"
             or pagination_request_style == "default"
         ):
-            self.next_page_token_jsonpath = "$.next_page"
+            self.next_page_token_jsonpath = (
+                "$.next_page"  # Set default for jsonpath_paginator
+            )
 
         get_url_params_styles = {
             "style1": self._get_url_params_offset_style,
@@ -183,16 +158,15 @@ class DynamicStream(RestApiStream):
         self.backoff_param = backoff_param
         self.backoff_time_extension = backoff_time_extension
         self.store_raw_json_message = store_raw_json_message
-        
         if self.use_request_body_not_params:
-            self.prepare_request_payload = get_url_params_styles.get(
+            self.prepare_request_payload = get_url_params_styles.get(  # type: ignore
                 pagination_response_style, self._get_url_params_page_style
             )
         else:
-            self.get_url_params = get_url_params_styles.get(
+            self.get_url_params = get_url_params_styles.get(  # type: ignore
                 pagination_response_style, self._get_url_params_page_style
             )
-            
+
         self.pagination_request_style = pagination_request_style
         self.pagination_results_limit = pagination_results_limit
         self.pagination_next_page_param = pagination_next_page_param
@@ -210,9 +184,10 @@ class DynamicStream(RestApiStream):
             if pagination_page_size:
                 self.pagination_page_size = pagination_page_size
             else:
-                page_limit_param = (
-                    self.pagination_limit_per_page_param or "per_page"
-                )
+                if self.pagination_limit_per_page_param:
+                    page_limit_param = self.pagination_limit_per_page_param
+                else:
+                    page_limit_param = "per_page"
                 self.pagination_page_size = int(
                     self.params.get(page_limit_param, 25)
                 )
@@ -225,9 +200,10 @@ class DynamicStream(RestApiStream):
             if pagination_page_size:
                 self.pagination_page_size = pagination_page_size
             else:
-                page_limit_param = (
-                    self.pagination_limit_per_page_param or "limit"
-                )
+                if self.pagination_limit_per_page_param:
+                    page_limit_param = self.pagination_limit_per_page_param
+                else:
+                    page_limit_param = "limit"
                 self.pagination_page_size = int(
                     self.params.get(page_limit_param, 25)
                 )
@@ -236,41 +212,57 @@ class DynamicStream(RestApiStream):
                 self.ABORT_AT_RECORD_COUNT = self.pagination_results_limit
             self.pagination_page_size = pagination_page_size
 
+        # GitHub workaround flag retained for backward compatibility.
         self.use_fake_since_parameter = False
 
-    def _request(
-        self, prepared_request: requests.PreparedRequest, context: Optional[dict]
-    ) -> requests.Response:
-        """Perform a request with rate limiting (Decimal-safe)."""
-        try:
-            delay = float(self.rate_limit_delay or 0)
-        except Exception:
-            delay = 0.0
-
-        if delay > 0:
-            self.logger.debug(f"Applying rate limit delay of {delay}s")
-            time.sleep(delay)
-
-        return super()._request(prepared_request, context)
-
+        # --- NEW: era-based options (no-ops unless enabled) ---
+        self.era_based_incremental = bool(era_based_incremental)
+        self.era_field = era_field or "era_id"
+        self.initial_sync_era_id = initial_sync_era_id
+        self.configured_to_era_id = to_era_id
+        self.rate_limit_delay = float(rate_limit_delay or 0.0)
 
     @property
     def http_headers(self) -> dict:
-        """Return the http headers needed."""
+        """Return the http headers needed.
+
+        Returns:
+              A dictionary of the headers to be included in the request.
+
+        """
         headers = {}
         if "user_agent" in self.config:
             headers["User-Agent"] = self.config.get("user_agent")
+        # If not using an authenticator, you may also provide inline auth headers:
+        # headers["Private-Token"] = self.config.get("auth_token")
+
         if self.headers:
             for k, v in self.headers.items():
                 headers[k] = v
+
         return headers
 
     def backoff_wait_generator(
         self,
     ) -> Generator[Union[int, float], None, None]:
-        """Return a backoff generator for rate-limited APIs."""
+        """Return a backoff generator as required to manage Rate Limited APIs.
+
+        Supply a backoff_type in the config to indicate the style of backoff.
+        If the backoff response is in a header, supply a backoff_param
+        indicating what key contains the backoff delay.
+
+        Note: If the backoff_type is message, the message is parsed for numeric
+        values. It is assumed that the highest numeric value discovered is the
+        backoff value in seconds.
+
+        Returns:
+            Backoff Generator with value to wait based on the API Response.
+
+        """
+
         def _backoff_from_headers(exception):
             response_headers = exception.response.headers
+
             return (
                 int(response_headers.get(self.backoff_param, 0))
                 + self.backoff_time_extension
@@ -279,6 +271,7 @@ class DynamicStream(RestApiStream):
         def _get_wait_time_from_response(exception):
             response_message = exception.response.json().get("message", 0)
             res = [int(i) for i in response_message.split() if i.isdigit()]
+
             return int(max(res)) + self.backoff_time_extension
 
         if self.backoff_type == "message":
@@ -286,58 +279,37 @@ class DynamicStream(RestApiStream):
         elif self.backoff_type == "header":
             return self.backoff_runtime(value=_backoff_from_headers)
         else:
+            # No override required. Use SDK backoff_wait_generator
             return super().backoff_wait_generator()
 
     def get_new_paginator(self):
-        """Return the appropriate paginator.
+        """Return the requested paginator required to retrieve all data from the API.
 
-        For era-based incremental + page-number pagination:
-        - resume from saved page within the last era (if present)
-        - pass page_size to paginator so it can derive total_pages from item_count
+        Returns:
+            Paginator Class.
+
         """
-        # Era-based, page-number paginator with resume support
-        if self.era_based_incremental and self.pagination_request_style == "page_number_paginator":
-            # Default starting page
-            start_value = self.pagination_initial_offset
+        self.logger.info(
+            f"the next_page_token_jsonpath = {self.next_page_token_jsonpath}."
+        )
 
-            # Try resuming page within the last era
-            try:
-                bm = self.get_starting_composite_bookmark(None) or {}
-                if bm.get("page_at_last_era"):
-                    start_value = bm["page_at_last_era"]
-            except Exception:
-                pass
-
-            paginator = EraBasedPageNumberPaginator(
-                start_value=start_value,
-                jsonpath=getattr(self, 'next_page_token_jsonpath', None),
-                era_field=self.era_field,
-                max_pages_per_run=self.max_pages_per_run,
-                logger=self.logger,
-            )
-
-            # Let the paginator know the page size (for fallback math)
-            try:
-                if self.pagination_page_size:
-                    setattr(paginator, "page_size", int(self.pagination_page_size))
-            except Exception:
-                pass
-
-            return paginator
-
-        # Default paginators
         if (
             self.pagination_request_style == "jsonpath_paginator"
             or self.pagination_request_style == "default"
         ):
             return JSONPathPaginator(self.next_page_token_jsonpath)
-        elif self.pagination_request_style == "simple_header_paginator":
+        elif (
+            self.pagination_request_style == "simple_header_paginator"
+        ):  # Example Gitlab.com
             if self.next_page_token_jsonpath:
                 return JSONPathPaginator(self.next_page_token_jsonpath)
+
             return SimpleHeaderPaginator("X-Next-Page")
         elif self.pagination_request_style == "header_link_paginator":
             return HeaderLinkPaginator()
-        elif self.pagination_request_style == "restapi_header_link_paginator":
+        elif (
+            self.pagination_request_style == "restapi_header_link_paginator"
+        ):  # Example GitHub.com
             return RestAPIHeaderLinkPaginator(
                 pagination_page_size=self.pagination_page_size,
                 pagination_results_limit=self.pagination_results_limit,
@@ -370,206 +342,148 @@ class DynamicStream(RestApiStream):
                 pagination_page_size=self.pagination_page_size,
             )
         else:
-            msg = f"Unknown paginator {self.pagination_request_style}"
-            self.logger.error(msg)
-            raise ValueError(msg)
+            self.logger.error(
+                f"Unknown paginator {self.pagination_request_style}. Please declare "
+                f"a valid paginator."
+            )
+            raise ValueError(
+                f"Unknown paginator {self.pagination_request_style}. Please declare "
+                f"a valid paginator."
+            )
+    
+    def _request(  # type: ignore[override]
+        self, prepared_request: requests.PreparedRequest, context: Optional[dict]
+    ) -> requests.Response:
+        """Optionally apply a small delay between requests to respect API limits.
 
-    def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        """Parse response with era-based filtering and early termination."""
-        if not self.era_based_incremental:
-            yield from extract_jsonpath(self.records_path, input=response.json())
-            return
+        Args:
+            prepared_request: required - a prepared requests.Request.
+            context: optional - the singer context object.
 
-        bookmark = self.get_starting_composite_bookmark(None)
-        last_era = bookmark.get("last_era_id") if bookmark else None
-        processed_in_last_era = set(bookmark.get("processed_in_last_era", [])) if bookmark else set()
-        
-        # Track if we've seen any old data
-        seen_old_era = False
-        records_yielded = 0
-        
-        for record in extract_jsonpath(self.records_path, input=response.json()):
-            era_value = record.get(self.era_field)
-            
-            if era_value is None:
-                self.logger.warning(f"Record missing era field '{self.era_field}': {record}")
-                continue
-            
-            # For initial sync with starting point
-            if not last_era and self.initial_sync_era_id and era_value < self.initial_sync_era_id:
-                self.logger.debug(f"Skipping era {era_value} < initial_sync_era_id {self.initial_sync_era_id}")
-                seen_old_era = True
-                break  # Stop processing this page
-            
-            # For incremental sync - stop immediately when hitting old data
-            if last_era and era_value <= last_era:
-                self.logger.info(f"Reached era {era_value} <= last_era {last_era}, stopping")
-                seen_old_era = True
-                break  # Stop processing this page
-            
-            # This is a new record, track and yield it
-            self._track_record(record, era_value)
-            records_yielded += 1
-            yield record
-        
-        # Signal paginator to stop if we've seen old data
-        if seen_old_era and hasattr(self._paginator, 'stop_pagination'):
-            self.logger.info(f"Setting stop_pagination after yielding {records_yielded} new records")
-            self._paginator.stop_pagination = True
+        Returns:
+            The requests.Response object.
 
-    def _get_record_id(self, record: dict, era_value: Any) -> str:
-        """Generate a stable unique identifier for a reward row.
-
-        Uses multiple fields to avoid collisions and ensure robust de-dupe
-        within the last processed era.
         """
-        parts = [
-            str(record.get("delegator_identifier", "")),
-            str(record.get("validator_public_key", "")),
-            str(era_value),
-            str(record.get("timestamp", "")),
-        ]
-        return "_".join(parts)
+        if self.rate_limit_delay and self.rate_limit_delay > 0:
+            time.sleep(self.rate_limit_delay)
+        return super()._request(prepared_request, context)
+    
+    def _get_last_era_from_state(self, context: Optional[dict]) -> Optional[int]:
+        """Return last processed era_id from state if replication_key is era_field.
 
-    def _track_record(self, record: dict, era_value: Any) -> None:
-        """Track record in the current run's composite bookmark.
+        Uses SDK-provided replication state. Only considered if this stream's
+        replication_key equals the configured era_field.
 
-        Also stores the current page index (if available) so we can resume
-        mid-era without restarting at page 1 in very large eras.
+        Args:
+            context: optional - the singer context object.
+
+        Returns:
+            An integer era_id if available, else None.
+
         """
-        record_id = self._get_record_id(record, era_value)
-
-        # Update composite bookmark
-        if not self._composite_bookmark or era_value > self._composite_bookmark.get("last_era_id", -1):
-            # New highest era
-            self._composite_bookmark = {
-                "last_era_id": era_value,
-                "processed_in_last_era": {record_id},
-            }
-        elif era_value == self._composite_bookmark.get("last_era_id"):
-            # Same era, add to set
-            self._composite_bookmark["processed_in_last_era"].add(record_id)
-
-        # Persist current page (if known) to allow mid-era resume
         try:
-            if hasattr(self, "_paginator") and hasattr(self._paginator, "current_value"):
-                self._composite_bookmark["page_at_last_era"] = self._paginator.current_value
+            last_val = self.get_starting_replication_key_value(context)
+            if last_val is None:
+                return None
+            if self.replication_key and self.replication_key == self.era_field:
+                return int(last_val)
         except Exception:
-            # Non-fatal: ignore if paginator isn't available yet
-            pass
-
-    def post_process(self, row: dict, context: Optional[dict] = None) -> Optional[dict]:
-        if self.era_based_incremental and self.replication_key:
-            rk_val = row.get(self.replication_key)
-            if rk_val is not None:
-                self._increment_stream_state({self.replication_key: rk_val}, context=context)
-        return flatten_json(row, self.except_keys, self.store_raw_json_message)
-
-    def _sync_records(
-        self, context: Optional[dict] = None
-    ) -> Generator[dict, None, None]:
-        """Sync records and manage composite bookmark state."""
-        # Reset tracking for new sync run
-        self._composite_bookmark = {}
-        
-        # Call parent sync_records
-        yield from super()._sync_records(context=context)
-        
-        # Save composite bookmark after sync
-        if self.era_based_incremental and self._composite_bookmark:
-            self._write_composite_bookmark(context)
-
-    def get_starting_composite_bookmark(self, context: Optional[dict]) -> Optional[dict]:
-        """Load composite bookmark from state.bookmarks[stream].composite_bookmark."""
-        if not self.era_based_incremental:
             return None
+        return None
 
-        tap_state = getattr(self, "_tap_state", {}) or {}
+    def _effective_from_era(self, context: Optional[dict], base_params: Dict[str, Any]) -> Optional[int]:
+        """Decide the from_era_id to send for this run.
 
-        # Exact location where we also write:
-        composite = get_state_if_exists(tap_state, self.name, key="composite_bookmark")
-        if composite:
-            pil = composite.get("processed_in_last_era")
-            if isinstance(pil, list):
-                composite["processed_in_last_era"] = set(pil)
-            self.logger.info(f"Found composite bookmark: {composite}")
-            return composite
+        Precedence:
+        1) If state has a last era_id, resume at last_era + 1 (API is inclusive).
+        2) Else if initial_sync_era_id is set, use it.
+        3) Else if user provided from_era_id in params, use it.
+        4) Else None (let API default to latest window).
 
-        # Fallback to standard replication bookmark, if present
-        rk_state = get_state_if_exists(tap_state, self.name) or {}
-        if self.replication_key and "replication_key_value" in rk_state:
-            return {
-                "last_era_id": rk_state["replication_key_value"],
-                "processed_in_last_era": set(),
-            }
+        Args:
+            context: optional - the singer context object.
+            base_params: required - params dict (may contain from_era_id).
+
+        Returns:
+            An integer from_era_id, or None.
+
+        """
+        last_from_state = self._get_last_era_from_state(context)
+        if last_from_state is not None:
+            # Avoid re-reading the last processed era (inclusive server behavior)
+            candidate = last_from_state + 1
+            try:
+                if "from_era_id" in base_params:
+                    candidate = max(candidate, int(base_params["from_era_id"]))
+            except Exception:
+                pass
+            return candidate
+
+        if self.initial_sync_era_id is not None:
+            return int(self.initial_sync_era_id)
+
+        if "from_era_id" in base_params:
+            try:
+                return int(base_params["from_era_id"])
+            except Exception:
+                return None
 
         return None
-    
-    def _write_composite_bookmark(self, context: Optional[dict]) -> None:
-        """Persist composite bookmark and emit STATE message immediately."""
-        if not self._composite_bookmark:
-            return
-
-        processed = self._composite_bookmark.get("processed_in_last_era", set())
-        self._composite_bookmark["processed_in_last_era"] = sorted(list(processed))
-
-        tap_state = getattr(self, "_tap_state", {}) or {}
-
-        write_stream_state(
-            tap_state,
-            self.name,
-            key="composite_bookmark",
-            val=self._composite_bookmark,
-        )
-
-        if self.replication_key:
-            write_stream_state(
-                tap_state, 
-                self.name, 
-                key="replication_key", 
-                val=self.replication_key
-            )
-            write_stream_state(
-                tap_state,
-                self.name,
-                key="replication_key_value",
-                val=self._composite_bookmark.get("last_era_id"),
-            )
-
-        self._tap_state = tap_state
-        
-        self._write_state_message()
-        
-        self.logger.info(f"Saved composite bookmark: last_era_id={self._composite_bookmark.get('last_era_id')}, "
-                        f"processed_count={len(processed)}")
 
     def _get_url_params_page_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return URL parameters for page-style pagination with a configurable limit."""
-        params: dict = {}
+        """Return a dictionary of values to be used in URL parameterization.
 
-        # Start with base params
+        Args:
+            context: optional - the singer context object.
+            next_page_token: optional - the token for the next page of results.
+
+        Returns:
+            An object containing the parameters to add to the request.
+
+        """
+        # Initialise Starting Values
+        last_run_date = get_start_date(self, context)
+        params: dict = {}
         if self.params:
             for k, v in self.params.items():
                 params[k] = v
+        if next_page_token:
+            if self.pagination_next_page_param:
+                next_page_parm = self.pagination_next_page_param
+            else:
+                next_page_parm = "page"
+            params[next_page_parm] = next_page_token
 
-        # Page number, if given by paginator
-        if next_page_token is not None:
-            next_page_param = self.pagination_next_page_param or "page"
-            params[next_page_param] = next_page_token
+        # --- Era-window injection (optional, backward compatible) ---
+        if self.era_based_incremental and (self.replication_key == self.era_field):
+            # Respect configured page size key if present; clamp to 250 if using 'page_size'
+            limit_key = self.pagination_limit_per_page_param or ("page_size" if "page_size" in params else None)
+            if limit_key and self.pagination_page_size is not None:
+                try:
+                    desired = int(self.pagination_page_size)
+                    if limit_key == "page_size":
+                        desired = min(desired, 250)
+                    params[limit_key] = desired
+                except Exception:
+                    pass
 
-        # Respect configured page size (remove previous hard clamp to 10)
-        limit_key = self.pagination_limit_per_page_param or "limit"
-        try:
-            desired = int(self.pagination_page_size or params.get(limit_key, 100))
-        except Exception:
-            desired = 100
-        params[limit_key] = desired
+            eff_from = self._effective_from_era(context, params)
+            if eff_from is not None:
+                params["from_era_id"] = eff_from
 
-        # Do NOT add date filters when using era-based incremental
-        if not self.era_based_incremental and self.replication_key:
-            last_run_date = get_start_date(self, context)
+            if self.configured_to_era_id is not None:
+                try:
+                    params["to_era_id"] = int(self.configured_to_era_id)
+                except Exception:
+                    pass
+
+            # In era mode, do not add date-based filters or sort overrides
+            return params
+
+        # --- Original incremental behavior (unchanged) ---
+        if self.replication_key:
             if self.source_search_field and self.source_search_query and last_run_date:
                 query_template = Template(self.source_search_query)
                 if self.use_request_body_not_params:
@@ -586,31 +500,60 @@ class DynamicStream(RestApiStream):
 
         return params
 
+
     def _get_url_params_offset_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return URL parameters for offset-style pagination with a configurable limit."""
+        """Return a dictionary of values to be used in URL parameterization.
+
+        Args:
+            context: optional - the singer context object.
+            next_page_token: optional - the token for the next page of results.
+
+        Returns:
+            An object containing the parameters to add to the request.
+
+        """
+        # Initialise Starting Values
+        last_run_date = get_start_date(self, context)
         params: dict = {}
 
         if self.params:
             for k, v in self.params.items():
                 params[k] = v
+        if next_page_token:
+            if self.pagination_next_page_param:
+                next_page_parm = self.pagination_next_page_param
+            else:
+                next_page_parm = "offset"
+            params[next_page_parm] = next_page_token
+        if self.pagination_page_size is not None:
+            if self.pagination_limit_per_page_param:
+                limit_per_page_param = self.pagination_limit_per_page_param
+            else:
+                limit_per_page_param = "limit"
+            try:
+                desired = int(self.pagination_page_size)
+                if limit_per_page_param == "page_size":
+                    desired = min(desired, 250)
+                params[limit_per_page_param] = desired
+            except Exception:
+                params[limit_per_page_param] = self.pagination_page_size
 
-        if next_page_token is not None:
-            next_page_param = self.pagination_next_page_param or "offset"
-            params[next_page_param] = next_page_token
+        # --- Era-window injection (optional, backward compatible) ---
+        if self.era_based_incremental and (self.replication_key == self.era_field):
+            eff_from = self._effective_from_era(context, params)
+            if eff_from is not None:
+                params["from_era_id"] = eff_from
+            if self.configured_to_era_id is not None:
+                try:
+                    params["to_era_id"] = int(self.configured_to_era_id)
+                except Exception:
+                    pass
+            return params
 
-        limit_key = self.pagination_limit_per_page_param or "limit"
-        # Prefer configured pagination_page_size; else existing value; else 100
-        try:
-            desired = int(self.pagination_page_size or params.get(limit_key, 100))
-        except Exception:
-            desired = 100
-        params[limit_key] = desired
-
-        # Do NOT add date filters when using era-based incremental
-        if not self.era_based_incremental and self.replication_key:
-            last_run_date = get_start_date(self, context)
+        # --- Original incremental behavior (unchanged) ---
+        if self.replication_key:
             if self.source_search_field and self.source_search_query and last_run_date:
                 query_template = Template(self.source_search_query)
                 if self.use_request_body_not_params:
@@ -630,57 +573,103 @@ class DynamicStream(RestApiStream):
     def _get_url_params_header_link(
         self, context: Optional[Dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return URL parameters for header link pagination."""
+        """Return a dictionary of values to be used in URL parameterization.
+
+        Logic based on https://github.com/MeltanoLabs/tap-github
+
+        Args:
+            context: optional - the singer context object.
+            next_page_token: optional - the token for the next page of results.
+
+        Returns:
+            An object containing the parameters to add to the request.
+
+        """
         params: dict = {}
-        
         if self.params:
             for k, v in self.params.items():
                 params[k] = v
-        
-        pagination_page_size = self.pagination_page_size or 25
-        limit_param = self.pagination_limit_per_page_param or "per_page"
-        params[limit_param] = pagination_page_size
-        
+        if self.pagination_page_size:
+            pagination_page_size = self.pagination_page_size
+        else:
+            pagination_page_size = 25  # Default to 25 per page if not set
+        if self.pagination_limit_per_page_param:
+            limit_per_page_param = self.pagination_limit_per_page_param
+        else:
+            limit_per_page_param = "per_page"
+        params[limit_per_page_param] = pagination_page_size
         if next_page_token:
             request_parameters = parse_qs(str(next_page_token))
             for k, v in request_parameters.items():
                 params[k] = v
-        
+
         if self.replication_key == "updated_at":
             params["sort"] = "updated"
             params["direction"] = "desc" if self.use_fake_since_parameter else "asc"
+
+        # Unfortunately the /starred, /stargazers (starred_at) and /events (created_at)
+        # endpoints do not support the "since" parameter out of the box. But we use a
+        # workaround in 'get_next_page_token'.
         elif self.replication_key in ["starred_at", "created_at"]:
             params["sort"] = "created"
             params["direction"] = "desc"
+
+        # Warning: /commits endpoint accept "since" but results are ordered by
+        # descending commit_timestamp
         elif self.replication_key == "commit_timestamp":
             params["direction"] = "desc"
+
         elif self.replication_key:
             self.logger.warning(
-                f"The replication key '{self.replication_key}' is not fully supported"
+                f"The replication key '{self.replication_key}' is not fully supported "
+                f"by this client yet."
             )
-        
+
         since = self.get_starting_timestamp(context)
         since_key = "since" if not self.use_fake_since_parameter else "fake_since"
         if self.replication_key and since:
             params[since_key] = since
+            # Leverage conditional requests to save API quotas
+            # https://github.community/t/how-does-if-modified-since-work/139627
             self._http_headers["If-modified-since"] = email.utils.format_datetime(since)
-        
+
         return params
 
     def _get_url_params_hateoas_body(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return URL parameters for HATEOAS pagination."""
+        """Return a dictionary of values to be used in URL parameterization.
+
+        Args:
+            context: optional - the singer context object.
+            next_page_token: optional - the token for the next page of results.
+
+
+            HATEOAS stands for "Hypermedia as the Engine of Application State".
+             See https://en.wikipedia.org/wiki/HATEOAS.
+
+            Note: Under the HATEOAS model, the returned token contains all the
+            required parameters for the subsequent call. The function splits the
+            parameters into Dict key value pairs for subsequent requests.
+
+        Returns:
+            An object containing the parameters to add to the request.
+
+        """
+        # Initialise Starting Values
+        last_run_date = get_start_date(self, context)
         params: dict = {}
-        
+
         if self.params:
             for k, v in self.params.items():
                 params[k] = v
-        
+
+        # Set Pagination Limits if required.
         if self.pagination_page_size and self.pagination_limit_per_page_param:
             params[self.pagination_limit_per_page_param] = self.pagination_page_size
-        
+
         if next_page_token:
+            # Parse the next_page_token for the path and parameters
             url_parsed = urlparse(next_page_token)
             if url_parsed.query:
                 params.update(parse_qsl(url_parsed.query))
@@ -690,8 +679,11 @@ class DynamicStream(RestApiStream):
                 self.path = ""
             else:
                 self.path = url_parsed.path
-        elif not self.era_based_incremental and self.replication_key:
-            last_run_date = get_start_date(self, context)
+        elif self.replication_key:
+            # Use incremental replication (if available) via a filter query being sent
+            # to the API This assumes storing a replication timestamp and querying
+            # records greater than that date in subsequent runs. Config the appropriate
+            # source field and query template.
             if self.source_search_field and self.source_search_query and last_run_date:
                 query_template = Template(self.source_search_query)
                 if self.use_request_body_not_params:
@@ -704,6 +696,35 @@ class DynamicStream(RestApiStream):
                     )
             elif self.source_search_field and last_run_date:
                 params[self.source_search_field] = "gt" + last_run_date
-        
+
         return params
+
+    def parse_response(self, response: requests.Response) -> Iterable[dict]:
+        """Parse the response and return an iterator of result rows.
+
+        Args:
+            response: required - the requests.Response given by the api call.
+
+        Yields:
+              Parsed records.
+
+        """
+        yield from extract_jsonpath(self.records_path, input=response.json())
+
+    def post_process(  # noqa: PLR6301
+        self,
+        row: types.Record,
+        context: Optional[types.Context] = None,  # noqa: ARG002
+    ) -> Optional[dict]:
+        """As needed, append or transform raw data to match expected structure.
+
+        Args:
+            row: required - the record for processing.
+            context: optional - the singer context object.
+
+        Returns:
+              A record that has been processed.
+
+        """
+        return flatten_json(row, self.except_keys, self.store_raw_json_message)
     

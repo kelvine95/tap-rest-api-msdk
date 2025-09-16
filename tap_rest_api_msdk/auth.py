@@ -317,3 +317,4 @@ def get_authenticator(self) -> Any:
     if auth_method == "aws":
         # Set the http_auth which is used in the Request call for AWS
         self.http_auth = self._authenticator
+    
