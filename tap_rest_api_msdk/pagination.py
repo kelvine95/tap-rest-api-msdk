@@ -225,3 +225,67 @@ class RestAPIHeaderLinkPaginator(HeaderLinkPaginator):
 
         return None
     
+class EraBasedPageNumberPaginator(RestAPIBasePageNumberPaginator):
+    """Custom page-number paginator for APIs that expose page_count/item_count.
+
+    This paginator:
+    - Increments the page counter numerically (1, 2, 3, ...).
+    - Determines "has more" using response.page_count (or item_count/page_size).
+    - Optionally respects a max page limit set by the stream.
+
+    It remains compatible with the base behavior when a jsonpath "next token"
+    is supplied, but for CSPR we rely on page_count.
+    """
+
+    def __init__(self, *args, era_field=None, max_pages_per_run=None, logger=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.era_field = era_field
+        self.max_pages_per_run = max_pages_per_run
+        self.pages_fetched = 0
+        self.stop_pagination = False
+        self.logger = logger
+
+    def has_more(self, response: requests.Response) -> bool:
+        """Return True if more pages exist.
+
+        Prefers page_count from the payload. Falls back to item_count/page_size
+        if page_count is not present. If neither is present, defers to the
+        base RestAPIBasePageNumberPaginator behavior (hasMore or jsonpath).
+        """
+        self.pages_fetched += 1
+
+        if self.stop_pagination:
+            if self.logger:
+                self.logger.info("Stopping pagination - signaled by stream.")
+            return False
+
+        if self.max_pages_per_run and self.pages_fetched >= self.max_pages_per_run:
+            if self.logger:
+                self.logger.info("Reached max_pages_per_run=%s", self.max_pages_per_run)
+            return False
+
+        # Try CSPR-style pagination first
+        try:
+            payload = response.json() or {}
+        except Exception:
+            return False
+
+        total_pages = payload.get("page_count") or payload.get("pageCount")
+        if total_pages is None:
+            # derive from item_count/page_size if available
+            item_count = payload.get("item_count")
+            page_size = getattr(self, "page_size", None)
+            if item_count is not None and page_size:
+                try:
+                    total_pages = (int(item_count) + int(page_size) - 1) // int(page_size)
+                except Exception:
+                    total_pages = None
+
+        if total_pages is not None:
+            # current_value is the *current page number* for BasePageNumberPaginator
+            return self.current_value < int(total_pages)
+
+        # Fallback to base behavior (jsonpath/hasMore)
+        return super().has_more(response)
+
+    

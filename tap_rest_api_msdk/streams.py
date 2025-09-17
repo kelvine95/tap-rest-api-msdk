@@ -24,6 +24,7 @@ from tap_rest_api_msdk.pagination import (
     RestAPIHeaderLinkPaginator,
     RestAPIOffsetPaginator,
     SimpleOffsetPaginator,
+    EraBasedPageNumberPaginator, 
 )
 from tap_rest_api_msdk.utils import flatten_json, get_start_date
 
@@ -285,31 +286,46 @@ class DynamicStream(RestApiStream):
     def get_new_paginator(self):
         """Return the requested paginator required to retrieve all data from the API.
 
+        When using page-number pagination with era-based incremental or with APIs
+        that expose page_count/item_count (like CSPR), use the custom
+        EraBasedPageNumberPaginator which derives "has more" from page_count.
+
         Returns:
             Paginator Class.
-
         """
-        self.logger.info(
-            f"the next_page_token_jsonpath = {self.next_page_token_jsonpath}."
-        )
+        self.logger.info("the next_page_token_jsonpath = %s.", getattr(self, "next_page_token_jsonpath", None))
+
+        # Use the enhanced paginator for page-number pagination when era-based mode is on,
+        # or when no jsonpath next token is provided (CSPR style).
+        if self.pagination_request_style == "page_number_paginator":
+        
+            paginator = EraBasedPageNumberPaginator(
+                start_value=self.pagination_initial_offset,
+                jsonpath=getattr(self, 'next_page_token_jsonpath', None),
+                era_field=getattr(self, "era_field", None),
+                max_pages_per_run=getattr(self, "max_pages_per_run", None),
+                logger=self.logger,
+            )
+            # Hint to paginator so it can derive total pages from item_count/page_size
+            try:
+                if self.pagination_page_size:
+                    setattr(paginator, "page_size", int(self.pagination_page_size))
+            except Exception:
+                pass
+            return paginator
 
         if (
             self.pagination_request_style == "jsonpath_paginator"
             or self.pagination_request_style == "default"
         ):
             return JSONPathPaginator(self.next_page_token_jsonpath)
-        elif (
-            self.pagination_request_style == "simple_header_paginator"
-        ):  # Example Gitlab.com
+        elif self.pagination_request_style == "simple_header_paginator":
             if self.next_page_token_jsonpath:
                 return JSONPathPaginator(self.next_page_token_jsonpath)
-
             return SimpleHeaderPaginator("X-Next-Page")
         elif self.pagination_request_style == "header_link_paginator":
             return HeaderLinkPaginator()
-        elif (
-            self.pagination_request_style == "restapi_header_link_paginator"
-        ):  # Example GitHub.com
+        elif self.pagination_request_style == "restapi_header_link_paginator":
             return RestAPIHeaderLinkPaginator(
                 pagination_page_size=self.pagination_page_size,
                 pagination_results_limit=self.pagination_results_limit,
@@ -329,11 +345,6 @@ class DynamicStream(RestApiStream):
             return BaseHATEOASPaginator()
         elif self.pagination_request_style == "single_page_paginator":
             return SinglePagePaginator()
-        elif self.pagination_request_style == "page_number_paginator":
-            return RestAPIBasePageNumberPaginator(
-                start_value=self.pagination_initial_offset,
-                jsonpath=self.next_page_token_jsonpath
-            )
         elif self.pagination_request_style == "simple_offset_paginator":
             return SimpleOffsetPaginator(
                 start_value=self.pagination_initial_offset,
@@ -343,14 +354,12 @@ class DynamicStream(RestApiStream):
             )
         else:
             self.logger.error(
-                f"Unknown paginator {self.pagination_request_style}. Please declare "
-                f"a valid paginator."
+                f"Unknown paginator {self.pagination_request_style}. Please declare a valid paginator."
             )
             raise ValueError(
-                f"Unknown paginator {self.pagination_request_style}. Please declare "
-                f"a valid paginator."
+                f"Unknown paginator {self.pagination_request_style}. Please declare a valid paginator."
             )
-    
+
     def _request(  # type: ignore[override]
         self, prepared_request: requests.PreparedRequest, context: Optional[dict]
     ) -> requests.Response:
@@ -433,57 +442,45 @@ class DynamicStream(RestApiStream):
     def _get_url_params_page_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return a dictionary of values to be used in URL parameterization.
+        """Return URL parameters for page-style pagination with optional limit.
+
+        This is identical to the original method but additionally:
+        - Sets the page-size parameter when `pagination_limit_per_page_param` is provided.
+        (Required by CSPR: `page_size`.)
+        - In era-based incremental mode for CSPR-like endpoints, it does NOT add generic
+        date filters; the stream's parse/paginator handle "era" bounds. If the config
+        supplies explicit `from_era_id`/`to_era_id` in `params`, they are passed through
+        unchanged.
 
         Args:
             context: optional - the singer context object.
-            next_page_token: optional - the token for the next page of results.
+            next_page_token: optional - the token for the next page (page number).
 
         Returns:
-            An object containing the parameters to add to the request.
-
+            Dict of request parameters.
         """
-        # Initialise Starting Values
         last_run_date = get_start_date(self, context)
         params: dict = {}
+
         if self.params:
             for k, v in self.params.items():
                 params[k] = v
-        if next_page_token:
-            if self.pagination_next_page_param:
-                next_page_parm = self.pagination_next_page_param
-            else:
-                next_page_parm = "page"
+
+        # Page number
+        if next_page_token is not None:
+            next_page_parm = self.pagination_next_page_param or "page"
             params[next_page_parm] = next_page_token
 
-        # --- Era-window injection (optional, backward compatible) ---
-        if self.era_based_incremental and (self.replication_key == self.era_field):
-            # Respect configured page size key if present; clamp to 250 if using 'page_size'
-            limit_key = self.pagination_limit_per_page_param or ("page_size" if "page_size" in params else None)
-            if limit_key and self.pagination_page_size is not None:
-                try:
-                    desired = int(self.pagination_page_size)
-                    if limit_key == "page_size":
-                        desired = min(desired, 250)
-                    params[limit_key] = desired
-                except Exception:
-                    pass
+        # ✅ NEW: Respect page size in page-number mode (e.g., page_size for CSPR)
+        limit_key = self.pagination_limit_per_page_param or None
+        if self.pagination_page_size is not None and limit_key:
+            try:
+                params[limit_key] = int(self.pagination_page_size)
+            except Exception:
+                params[limit_key] = self.pagination_page_size
 
-            eff_from = self._effective_from_era(context, params)
-            if eff_from is not None:
-                params["from_era_id"] = eff_from
-
-            if self.configured_to_era_id is not None:
-                try:
-                    params["to_era_id"] = int(self.configured_to_era_id)
-                except Exception:
-                    pass
-
-            # In era mode, do not add date-based filters or sort overrides
-            return params
-
-        # --- Original incremental behavior (unchanged) ---
-        if self.replication_key:
+        # Incremental logic (unchanged) — but skip when era-based mode is enabled
+        if self.replication_key and not getattr(self, "era_based_incremental", False):
             if self.source_search_field and self.source_search_query and last_run_date:
                 query_template = Template(self.source_search_query)
                 if self.use_request_body_not_params:
@@ -499,7 +496,6 @@ class DynamicStream(RestApiStream):
                 params["order_by"] = self.replication_key
 
         return params
-
 
     def _get_url_params_offset_style(
         self, context: Optional[dict], next_page_token: Optional[Any]

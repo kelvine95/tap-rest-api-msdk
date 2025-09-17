@@ -488,8 +488,6 @@ class TapRestApiMsdk(Tap):
             A list of streams.
 
         """
-        # print(self.top_level_properties.to_dict())
-
         streams = []
         for stream in self.config["streams"]:
             # resolve config
@@ -513,6 +511,19 @@ class TapRestApiMsdk(Tap):
             offset_records_jsonpath = stream.get(
                 "offset_records_jsonpath",
                 self.config.get("offset_records_jsonpath", None),
+            )
+
+            # NEW: era-based options (optional, fully backward compatible)
+            era_based_incremental = stream.get(
+                "era_based_incremental", self.config.get("era_based_incremental", False)
+            )
+            era_field = stream.get("era_field", self.config.get("era_field", "era_id"))
+            initial_sync_era_id = stream.get(
+                "initial_sync_era_id", self.config.get("initial_sync_era_id", None)
+            )
+            to_era_id = stream.get("to_era_id", self.config.get("to_era_id", None))
+            rate_limit_delay = stream.get(
+                "rate_limit_delay", self.config.get("rate_limit_delay", 0.0)
             )
 
             schema = {}
@@ -588,10 +599,17 @@ class TapRestApiMsdk(Tap):
                     backoff_time_extension=self.config.get("backoff_time_extension"),
                     store_raw_json_message=self.config.get("store_raw_json_message"),
                     authenticator=self._authenticator,
+                    # NEW: pass era-based options
+                    era_based_incremental=era_based_incremental,
+                    era_field=era_field,
+                    initial_sync_era_id=initial_sync_era_id,
+                    to_era_id=to_era_id,
+                    rate_limit_delay=rate_limit_delay,
                 )
             )
 
         return streams
+
 
     def get_schema(
         self,
