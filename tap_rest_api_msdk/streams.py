@@ -286,27 +286,25 @@ class DynamicStream(RestApiStream):
     def get_new_paginator(self):
         """Return the requested paginator required to retrieve all data from the API.
 
-        When using page-number pagination with era-based incremental or with APIs
-        that expose page_count/item_count (like CSPR), use the custom
-        EraBasedPageNumberPaginator which derives "has more" from page_count.
-
-        Returns:
-            Paginator Class.
+        When using page-number pagination with CSPR (which returns 'page_count' and
+        'item_count'), use the EraBasedPageNumberPaginator so 'has more' is derived
+        from 'page_count'. For all other styles, keep existing behavior.
         """
-        self.logger.info("the next_page_token_jsonpath = %s.", getattr(self, "next_page_token_jsonpath", None))
+        self.logger.info(
+            "the next_page_token_jsonpath = %s.",
+            getattr(self, "next_page_token_jsonpath", None),
+        )
 
-        # Use the enhanced paginator for page-number pagination when era-based mode is on,
-        # or when no jsonpath next token is provided (CSPR style).
+        # Page-number pagination: use the custom paginator that reads page_count.
         if self.pagination_request_style == "page_number_paginator":
-        
             paginator = EraBasedPageNumberPaginator(
                 start_value=self.pagination_initial_offset,
-                jsonpath=getattr(self, 'next_page_token_jsonpath', None),
+                jsonpath=getattr(self, "next_page_token_jsonpath", None),
                 era_field=getattr(self, "era_field", None),
                 max_pages_per_run=getattr(self, "max_pages_per_run", None),
                 logger=self.logger,
             )
-            # Hint to paginator so it can derive total pages from item_count/page_size
+            # Hint to paginator so it can optionally compute total pages
             try:
                 if self.pagination_page_size:
                     setattr(paginator, "page_size", int(self.pagination_page_size))
@@ -361,34 +359,27 @@ class DynamicStream(RestApiStream):
             )
 
     def _request(  # type: ignore[override]
-        self, prepared_request: requests.PreparedRequest, context: Optional[dict]
-    ) -> requests.Response:
-        """Optionally apply a small delay between requests to respect API limits.
+            self, prepared_request: requests.PreparedRequest, context: Optional[dict]
+        ) -> requests.Response:
+            """Optionally apply a small delay between requests to respect API limits.
 
-        Args:
-            prepared_request: required - a prepared requests.Request.
-            context: optional - the singer context object.
+            Args:
+                prepared_request: required - a prepared requests.Request.
+                context: optional - the singer context object.
 
-        Returns:
-            The requests.Response object.
+            Returns:
+                The requests.Response object.
 
-        """
-        if self.rate_limit_delay and self.rate_limit_delay > 0:
-            time.sleep(self.rate_limit_delay)
-        return super()._request(prepared_request, context)
-    
+            """
+            if self.rate_limit_delay and self.rate_limit_delay > 0:
+                time.sleep(self.rate_limit_delay)
+            return super()._request(prepared_request, context)
+        
     def _get_last_era_from_state(self, context: Optional[dict]) -> Optional[int]:
-        """Return last processed era_id from state if replication_key is era_field.
+        """Return last processed era_id from state if replication_key is the era field.
 
-        Uses SDK-provided replication state. Only considered if this stream's
-        replication_key equals the configured era_field.
-
-        Args:
-            context: optional - the singer context object.
-
-        Returns:
-            An integer era_id if available, else None.
-
+        Uses the SDK replication state. Only considered when this stream's
+        replication_key matches the configured era_field (e.g., 'era_id').
         """
         try:
             last_val = self.get_starting_replication_key_value(context)
@@ -407,19 +398,10 @@ class DynamicStream(RestApiStream):
         1) If state has a last era_id, resume at last_era + 1 (API is inclusive).
         2) Else if initial_sync_era_id is set, use it.
         3) Else if user provided from_era_id in params, use it.
-        4) Else None (let API default to latest window).
-
-        Args:
-            context: optional - the singer context object.
-            base_params: required - params dict (may contain from_era_id).
-
-        Returns:
-            An integer from_era_id, or None.
-
+        4) Else None (let API default).
         """
         last_from_state = self._get_last_era_from_state(context)
         if last_from_state is not None:
-            # Avoid re-reading the last processed era (inclusive server behavior)
             candidate = last_from_state + 1
             try:
                 if "from_era_id" in base_params:
@@ -439,29 +421,23 @@ class DynamicStream(RestApiStream):
 
         return None
 
+
     def _get_url_params_page_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return URL parameters for page-style pagination with optional limit.
+        """Return URL parameters for page-style pagination.
 
-        This is identical to the original method but additionally:
-        - Sets the page-size parameter when `pagination_limit_per_page_param` is provided.
-        (Required by CSPR: `page_size`.)
-        - In era-based incremental mode for CSPR-like endpoints, it does NOT add generic
-        date filters; the stream's parse/paginator handle "era" bounds. If the config
-        supplies explicit `from_era_id`/`to_era_id` in `params`, they are passed through
-        unchanged.
-
-        Args:
-            context: optional - the singer context object.
-            next_page_token: optional - the token for the next page (page number).
-
-        Returns:
-            Dict of request parameters.
+        Minimal change vs. original:
+        - Always forward `page` and `page_size` (capped at 250 for CSPR).
+        - If era-based mode is enabled and replication_key == era_field, inject
+        `from_era_id` computed from state/initial config.
+        - Pass through `to_era_id` when configured in params or via `configured_to_era_id`.
+        - Skip generic date filtering when era-based mode is on.
         """
         last_run_date = get_start_date(self, context)
         params: dict = {}
 
+        # Start with configured params
         if self.params:
             for k, v in self.params.items():
                 params[k] = v
@@ -471,16 +447,38 @@ class DynamicStream(RestApiStream):
             next_page_parm = self.pagination_next_page_param or "page"
             params[next_page_parm] = next_page_token
 
-        # ✅ NEW: Respect page size in page-number mode (e.g., page_size for CSPR)
-        limit_key = self.pagination_limit_per_page_param or None
-        if self.pagination_page_size is not None and limit_key:
+        # Page size (cap at 250 for this API)
+        limit_key = self.pagination_limit_per_page_param or "page_size"
+        if self.pagination_page_size is not None:
             try:
-                params[limit_key] = int(self.pagination_page_size)
+                desired = int(self.pagination_page_size)
             except Exception:
-                params[limit_key] = self.pagination_page_size
+                desired = self.pagination_page_size
+            try:
+                desired = int(desired)
+                desired = min(desired, 250)
+            except Exception:
+                pass
+            params[limit_key] = desired
 
-        # Incremental logic (unchanged) — but skip when era-based mode is enabled
-        if self.replication_key and not getattr(self, "era_based_incremental", False):
+        # Era window injection for CSPR rewards (era_id incremental)
+        if self.era_based_incremental and (self.replication_key == self.era_field):
+            eff_from = self._effective_from_era(context, params)
+            if eff_from is not None:
+                params["from_era_id"] = eff_from
+
+            # Optional upper cap
+            if "to_era_id" not in params and getattr(self, "configured_to_era_id", None) is not None:
+                try:
+                    params["to_era_id"] = int(self.configured_to_era_id)
+                except Exception:
+                    pass
+
+            # Do not add generic date-based filters in this mode
+            return params
+
+        # ---- Original incremental behavior (unchanged) ----
+        if self.replication_key:
             if self.source_search_field and self.source_search_query and last_run_date:
                 query_template = Template(self.source_search_query)
                 if self.use_request_body_not_params:
@@ -712,15 +710,23 @@ class DynamicStream(RestApiStream):
         row: types.Record,
         context: Optional[types.Context] = None,  # noqa: ARG002
     ) -> Optional[dict]:
-        """As needed, append or transform raw data to match expected structure.
+        """Optionally transform raw data and persist replication state.
 
-        Args:
-            row: required - the record for processing.
-            context: optional - the singer context object.
-
-        Returns:
-              A record that has been processed.
-
+        When using era-based incremental and replication_key == era_field (e.g., 'era_id'),
+        persist the highest era_id seen so that subsequent runs resume from last_era + 1.
         """
+        # Update replication state on-the-fly for resume
+        if (
+            self.era_based_incremental
+            and self.replication_key
+            and self.replication_key == self.era_field
+        ):
+            rk_val = row.get(self.replication_key)
+            if rk_val is not None:
+                try:
+                    # store as integer if possible
+                    self._increment_stream_state({self.replication_key: int(rk_val)}, context=context)
+                except Exception:
+                    self._increment_stream_state({self.replication_key: rk_val}, context=context)
+
         return flatten_json(row, self.except_keys, self.store_raw_json_message)
-    
