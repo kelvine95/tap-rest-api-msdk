@@ -5,7 +5,8 @@ from typing import Any, Dict, Iterable, Optional
 
 import requests
 from singer_sdk.helpers.jsonpath import extract_jsonpath
-from tap_rest_api_msdk.client import TwitterApiStream
+from singer_sdk.streams import RESTStream
+from singer_sdk.authenticators import APIKeyAuthenticator
 from tap_rest_api_msdk.utils import flatten_json
 
 def _epoch_seconds(dt_obj: datetime) -> int:
@@ -14,29 +15,40 @@ def _epoch_seconds(dt_obj: datetime) -> int:
         dt_obj = dt_obj.replace(tzinfo=timezone.utc)
     return int(dt_obj.timestamp())
 
-class DynamicTwitterStream(TwitterApiStream):
+class DynamicStream(RESTStream):
     """A dynamic stream that handles pagination, limits, and incremental loading."""
-
+    url_base = "https://api.twitterapi.io"
+    
     def __init__(self, tap: Any, name: str, schema: dict, config: dict) -> None:
         """Initialize the stream."""
         super().__init__(tap=tap, name=name, schema=schema)
-        self.config = config
+        self._stream_config = config
         self._records_processed = 0
 
     @property
     def path(self) -> str:
         """Return the API path for the stream."""
-        return self.config.get("path", "")
+        return self._stream_config.get("path", "")
+
+    @property
+    def authenticator(self) -> APIKeyAuthenticator:
+        """Return a new authenticator object."""
+        return APIKeyAuthenticator.create_for_stream(
+            self,
+            key="X-API-Key",
+            value=self.config.get("api_keys", {}).get("X-API-Key", ""),
+            location="header",
+        )
 
     def get_url_params(self, context: Optional[dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
         """Return a dictionary of values to be used in URL parameterization."""
-        params = self.config.get("params", {}).copy()
+        params = self._stream_config.get("params", {}).copy()
 
         if next_page_token:
             params["cursor"] = next_page_token
 
         start_date = self.get_starting_timestamp(context)
-        rra_config = self.config.get("replication_request_adapter")
+        rra_config = self._stream_config.get("replication_request_adapter")
         
         if self.replication_key and start_date and rra_config:
             mode = rra_config.get("mode")
@@ -64,10 +76,10 @@ class DynamicTwitterStream(TwitterApiStream):
 
     def parse_response(self, response: requests.Response) -> Iterable[dict]:
         """Parse the response and yield records."""
-        records_path = self.config.get("records_path", "$[*]")
+        records_path = self._stream_config.get("records_path", "$[*]")
         for record in extract_jsonpath(records_path, input=response.json()):
-            if self.config.get("max_records_limit") and self._records_processed >= self.config["max_records_limit"]:
-                self.logger.info(f"Stream '{self.name}' reached its record limit of {self.config['max_records_limit']}.")
+            if self._stream_config.get("max_records_limit") and self._records_processed >= self._stream_config["max_records_limit"]:
+                self.logger.info(f"Stream '{self.name}' reached its record limit of {self._stream_config['max_records_limit']}.")
                 break
             
             if self._tap.max_ingestion_limit and self._tap.total_records_processed >= self._tap.max_ingestion_limit:
@@ -80,10 +92,40 @@ class DynamicTwitterStream(TwitterApiStream):
             self._records_processed += 1
             if hasattr(self._tap, 'total_records_processed'):
                 self._tap.total_records_processed += 1
+    
+    def _maybe_register_id(self, flat_record: dict, original_row: dict) -> None:
+        """Register a tweet ID into state if configured."""
+        cfg = self._stream_config.get("id_registry_config", {})
+        registry_key = cfg.get("registry_key")
+        if not registry_key: return
+
+        id_path = cfg.get("id_path", "$.id")
+        tweet_id = None
+        try:
+            matches = list(extract_jsonpath(id_path, input=original_row))
+            if matches: tweet_id = str(matches[0])
+        except Exception: tweet_id = None
+        
+        if not tweet_id:
+            fallback = flat_record.get("id")
+            if fallback: tweet_id = str(fallback)
+        
+        if not tweet_id: return
+        
+        min_likes = int(cfg.get("min_like_count", 0))
+        like_count = int(flat_record.get("likeCount", 0) or 0)
+        if like_count < min_likes: return
+
+        reg = self._tap.state.setdefault("registry", {})
+        reg_list = reg.setdefault(registry_key, [])
+        if tweet_id not in reg_list:
+            reg_list.append(tweet_id)
+            self._tap.state["registry"] = reg
+            self._tap.persist_state()
 
     def post_process(self, row: dict, context: Optional[dict] = None) -> Optional[dict]:
-        """Transform record data and handle date formatting."""
-        flat_record = flatten_json(row, self.config.get("except_keys", []))
+        """Transform record data, format dates, and register IDs."""
+        flat_record = flatten_json(row, self._stream_config.get("except_keys", []))
         
         date_fields = ["createdAt", "author_createdAt"]
         for field in date_fields:
@@ -94,9 +136,11 @@ class DynamicTwitterStream(TwitterApiStream):
                 except ValueError:
                     self.logger.warning(f"Could not parse timestamp for '{field}': {flat_record[field]}")
         
-        if "inject_metadata" in self.config:
-            for k, v in self.config["inject_metadata"].items():
+        if "inject_metadata" in self._stream_config:
+            for k, v in self._stream_config["inject_metadata"].items():
                 flat_record[k] = v
+        
+        self._maybe_register_id(flat_record=flat_record, original_row=row)
         
         return flat_record
     
