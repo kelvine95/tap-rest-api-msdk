@@ -94,18 +94,20 @@ class DynamicStream(RestApiStream):
         authenticator: Optional[object] = None,
         inject_metadata: Optional[dict] = None,
         id_registry_config: Optional[dict] = None,
-        max_records_limit: Optional[int] = None,  # Per-stream total record limit
+        max_records_limit: Optional[int] = None,
         config: Optional[dict] = None,
     ) -> None:
         """Class initialization."""
+        # Correctly call the parent class __init__
         super().__init__(tap=tap, name=name, schema=schema)
-        # Use a non-conflicting name for the stream's config
+        
+        # Store a reference to the tap object with the correct variable name
+        self._tap = tap
         self._stream_config = config or {}
 
         if primary_keys is None:
             primary_keys = []
 
-        self.name = name
         self.path = path
         self.params = params if params else {}
         self.headers = headers
@@ -115,7 +117,6 @@ class DynamicStream(RestApiStream):
         self.replication_key = replication_key
         self.except_keys = except_keys
         self.records_path = records_path
-
         self.inject_metadata = inject_metadata or {}
         self.id_registry_config = id_registry_config or {}
         self._id_registry_cache: set[str] = set()
@@ -543,8 +544,6 @@ class DynamicStream(RestApiStream):
                 )
                 break
 
-            # Check 2: Global tap limit
-            # CORRECTED: Use self._tap instead of self.tap
             if self._tap.max_ingestion_limit and self._tap.total_records_processed >= self._tap.max_ingestion_limit:
                 if not self._tap.reached_max_limit: # Log message only once
                     self._tap.logger.info(
