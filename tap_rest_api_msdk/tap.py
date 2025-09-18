@@ -1,10 +1,11 @@
-"""Config-driven REST tap with safe discovery and Twitter-friendly adapters."""
+# tap_rest_api_msdk/tap.py
 
-from __future__ import annotations
+"""rest-api tap class."""
 
 import copy
 import json
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, List, Optional, Dict
 
 import requests
 from genson import SchemaBuilder
@@ -18,266 +19,917 @@ from tap_rest_api_msdk.streams import DynamicStream
 from tap_rest_api_msdk.utils import flatten_json
 
 
-class TapRestApiMsdk(Tap):
-    name = "tap-rest-api-msdk"
-    tap_name = name  # used by SDK auth base
+def _iso_utc(dt_obj: datetime) -> str:
+    """Format datetime as strict ISO-8601 in UTC with 'Z' suffix.
 
+    Args:
+        dt_obj: Datetime object, naive treated as UTC.
+
+    Returns:
+        ISO-8601 formatted string (YYYY-MM-DDTHH:MM:SSZ).
+    """
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    return dt_obj.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _epoch_seconds(dt_obj: datetime) -> int:
+    """Convert a datetime (naive treated as UTC) to epoch seconds.
+
+    Args:
+        dt_obj: Datetime object.
+
+    Returns:
+        Integer epoch seconds.
+    """
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    return int(dt_obj.timestamp())
+
+
+class TapRestApiMsdk(Tap):
+    """rest-api tap class."""
+
+    name = "tap-rest-api-msdk"
+
+    # Required for Authentication in tap.py - function APIAuthenticatorBase
+    tap_name = name
+
+    # Used to cache the Authenticator to prevent over hitting the Authentication
+    # end-point for each stream.
     _authenticator: Optional[APIAuthenticatorBase] = None
 
-    # ---------- Common stream-level options ----------
+    # ----------------------
+    # Common (stream) schema
+    # ----------------------
     common_properties = th.PropertiesList(
-        th.Property("path", th.StringType),
-        th.Property("params", th.ObjectType(), default={}),
-        th.Property("headers", th.ObjectType(), default={}),
-        th.Property("records_path", th.StringType, description="JSONPath to records."),
-        th.Property("primary_keys", th.ArrayType(th.StringType), default=[]),
-        th.Property("replication_key", th.StringType),
-        th.Property("except_keys", th.ArrayType(th.StringType), default=[]),
-        th.Property("num_inference_records", th.IntegerType, default=50),
-        th.Property("start_date", th.DateTimeType),
-        th.Property("source_search_field", th.StringType),
-        th.Property("source_search_query", th.StringType),
-        th.Property("next_page_token_path", th.StringType),
-        th.Property("pagination_request_style", th.StringType, default="default"),
-        th.Property("pagination_response_style", th.StringType, default="default"),
-        th.Property("pagination_page_size", th.IntegerType),
-        th.Property("pagination_results_limit", th.IntegerType),
-        th.Property("pagination_next_page_param", th.StringType),
-        th.Property("pagination_limit_per_page_param", th.StringType),
-        th.Property("pagination_total_limit_param", th.StringType, default="total"),
-        th.Property("pagination_initial_offset", th.IntegerType, default=1),
-        th.Property("offset_records_jsonpath", th.StringType),
-        th.Property("use_request_body_not_params", th.BooleanType, default=False),
-        th.Property("backoff_type", th.StringType, allowed_values=[None, "message", "header"], default=None),
-        th.Property("backoff_param", th.StringType, default="Retry-After"),
-        th.Property("backoff_time_extension", th.IntegerType, default=0),
-        th.Property("store_raw_json_message", th.BooleanType, default=False),
-        # New:
-        th.Property("replication_request_adapter", th.ObjectType(), description="Translate bookmarks into request params."),
-        th.Property("disable_discovery_probe", th.BooleanType, default=False, description="Skip live request during discovery."),
+        th.Property(
+            "path",
+            th.StringType,
+            required=False,
+            description="the path appended to the `api_url`. Stream-level path will "
+            "overwrite top-level path",
+        ),
+        th.Property(
+            "params",
+            th.ObjectType(),
+            default={},
+            required=False,
+            description="an object providing the `params` in a `requests.get` method. "
+            "Stream level params will be merged"
+            "with top-level params with stream level params overwriting"
+            "top-level params with the same key.",
+        ),
+        th.Property(
+            "headers",
+            th.ObjectType(),
+            required=False,
+            description="An object of headers to pass into the api calls. Stream level"
+            "headers will be merged with top-level params with stream"
+            "level params overwriting top-level params with the same key.",
+        ),
+        th.Property(
+            "records_path",
+            th.StringType,
+            required=False,
+            description="a jsonpath string representing the path in the requests "
+            "response that contains the records to process. Defaults "
+            "to `$[*]`. Stream level records_path will overwrite "
+            "the top-level records_path",
+        ),
+        th.Property(
+            "primary_keys",
+            th.ArrayType(th.StringType),
+            required=False,
+            description="a list of the json keys of the primary key for the stream.",
+        ),
+        th.Property(
+            "replication_key",
+            th.StringType,
+            required=False,
+            description="the json response field representing the replication key."
+            "Note that this should be an incrementing integer or datetime object.",
+        ),
+        th.Property(
+            "except_keys",
+            th.ArrayType(th.StringType),
+            default=[],
+            required=False,
+            description="This tap automatically flattens the entire json structure "
+            "and builds keys based on the corresponding paths.; Keys, "
+            "whether composite or otherwise, listed in this dictionary "
+            "will not be recursively flattened, but instead their values "
+            "will be; turned into a json string and processed in that "
+            "format. This is also automatically done for any lists within "
+            "the records; therefore, records are not duplicated for each "
+            "item in lists.",
+        ),
+        th.Property(
+            "num_inference_records",
+            th.NumberType,
+            default=50,
+            required=False,
+            description="number of records used to infer the stream's schema. "
+            "Defaults to 50.",
+        ),
+        th.Property(
+            "start_date",
+            th.DateTimeType,
+            required=False,
+            description="An optional field. Normally required when using the"
+            "replication_key. This is the initial starting date when using a"
+            "date based replication key and there is no state available.",
+        ),
+        th.Property(
+            "source_search_field",
+            th.StringType,
+            required=False,
+            description="An optional field name which can be used for querying "
+            "specific records from supported API's. The intend for this "
+            "parameter is to continue incrementally processing from a "
+            "previous state. Example `last-updated`. Note: You must also "
+            "set the replication_key, where the replication_key isjson "
+            "response representation of the API `source_search_field`. "
+            "You shouldalso supply the `source_search_query`, "
+            "`replication_key` and `start_date`.",
+        ),
+        th.Property(
+            "source_search_query",
+            th.StringType,
+            required=False,
+            description="An optional query template to be issued against the API."
+            "Substitute the query field you are querying against with "
+            "$last_run_date. Atrun-time, the tap will dynamically update "
+            "the token with either the `start_date`or the last bookmark / "
+            "state value. A simple template Example for FHIR API's: "
+            "gt$last_run_date. A more complex example against an "
+            "Opensearch API, "
+            '{"bool": {"filter": [{"range": '
+            '{ "meta.lastUpdated": { "gt": "$last_run_date" }}}] }} .'
+            "Note: Any required double quotes in the query template must "
+            "be escaped.",
+        ),
     )
 
-    # ---------- Top-level config ----------
+    # -------------------
+    # Top-level schema
+    # -------------------
     top_level_properties = th.PropertiesList(
-        th.Property("api_url", th.StringType, required=True),
-        th.Property("auth_method", th.StringType, default="no_auth"),
-        th.Property("api_keys", th.ObjectType()),
-        th.Property("client_id", th.StringType),
-        th.Property("client_secret", th.StringType),
-        th.Property("username", th.StringType),
-        th.Property("password", th.StringType),
-        th.Property("bearer_token", th.StringType),
-        th.Property("refresh_token", th.StringType),
-        th.Property("grant_type", th.StringType),
-        th.Property("scope", th.StringType),
-        th.Property("access_token_url", th.StringType),
-        th.Property("redirect_uri", th.StringType),
-        th.Property("oauth_extras", th.ObjectType()),
-        th.Property("oauth_expiration_secs", th.IntegerType),
-        th.Property("aws_credentials", th.ObjectType()),
-        th.Property("next_page_token_path", th.StringType),
-        th.Property("pagination_request_style", th.StringType, default="default"),
-        th.Property("pagination_response_style", th.StringType, default="default"),
-        th.Property("use_request_body_not_params", th.BooleanType, default=False),
-        th.Property("backoff_type", th.StringType, allowed_values=[None, "message", "header"], default=None),
-        th.Property("backoff_param", th.StringType, default="Retry-After"),
-        th.Property("backoff_time_extension", th.IntegerType, default=0),
-        th.Property("store_raw_json_message", th.BooleanType, default=False),
-        th.Property("pagination_page_size", th.IntegerType),
-        th.Property("pagination_results_limit", th.IntegerType),
-        th.Property("pagination_next_page_param", th.StringType),
-        th.Property("pagination_limit_per_page_param", th.StringType),
-        th.Property("pagination_total_limit_param", th.StringType, default="total"),
-        th.Property("pagination_initial_offset", th.IntegerType, default=1),
-        th.Property("offset_records_jsonpath", th.StringType),
-        th.Property("schema_overrides", th.ObjectType(), description="Singer schema fragments to merge per stream name."),
-        th.Property("streams", th.ArrayType(th.ObjectType())),
-        # Budgets + resiliency:
-        th.Property("max_records_total", th.IntegerType),
-        th.Property("max_records_per_stream", th.IntegerType),
-        th.Property("soft_fail_status_codes", th.ArrayType(th.IntegerType), description="Status codes to treat as empty."),
-        th.Property("request_timeout_secs", th.IntegerType, description="Per-request timeout in seconds."),
+        th.Property(
+            "api_url",
+            th.StringType,
+            required=True,
+            description="the base url/endpoint for the desired api",
+        ),
+        th.Property(
+            "auth_method",
+            th.StringType,
+            default="no_auth",
+            required=False,
+            description="The method of authentication used by the API. Supported "
+            "options include oauth: for OAuth2 authentication, basic: "
+            "Basic Header authorization - base64-encoded username + "
+            "password config items, api_key: for API Keys in the header "
+            "e.g. X-API-KEY,bearer_token: for Bearer token authorization, "
+            "aws: for AWS Authentication.Defaults to no_auth which will "
+            "take authentication parameters passed via the headersconfig.",
+        ),
+        th.Property(
+            "api_keys",
+            th.ObjectType(),
+            required=False,
+            description="A object of API Key/Value pairs used by the api_key auth "
+            "method Example: { X-API-KEY: my secret value}.",
+        ),
+        th.Property(
+            "client_id",
+            th.StringType,
+            required=False,
+            description="Used for the OAuth2 authentication method. The public "
+            "application ID that's assigned for Authentication. The "
+            "client_id should accompany a client_secret.",
+        ),
+        th.Property(
+            "client_secret",
+            th.StringType,
+            required=False,
+            description="Used for the OAuth2 authentication method. The client_secret "
+            "is a secret known only to the application and the "
+            "authorization server. It is essential the application's "
+            "own password.",
+        ),
+        th.Property(
+            "username",
+            th.StringType,
+            required=False,
+            description="Used for a number of authentication methods that use a user "
+            "password combination for authentication.",
+        ),
+        th.Property(
+            "password",
+            th.StringType,
+            required=False,
+            description="Used for a number of authentication methods that use a user "
+            "password combination for authentication.",
+        ),
+        th.Property(
+            "bearer_token",
+            th.StringType,
+            required=False,
+            description="Used for the Bearer Authentication method, which uses a token "
+            "as part of the authorization header for authentication.",
+        ),
+        th.Property(
+            "refresh_token",
+            th.StringType,
+            required=False,
+            description="An OAuth2 Refresh Token is a string that the OAuth2 "
+            "client can use to get a new access token without the user's "
+            "interaction.",
+        ),
+        th.Property(
+            "grant_type",
+            th.StringType,
+            required=False,
+            description="Used for the OAuth2 authentication method. The grant_type "
+            "is required to describe the OAuth2 flow. Flows support by "
+            "this tap include client_credentials, refresh_token, password.",
+        ),
+        th.Property(
+            "scope",
+            th.StringType,
+            required=False,
+            description="Used for the OAuth2 authentication method. The scope is "
+            "optional, it is a mechanism to limit the amount of access "
+            "that is granted to an access token. One or more scopes can "
+            "be provided delimited by a space.",
+        ),
+        th.Property(
+            "access_token_url",
+            th.StringType,
+            required=False,
+            description="Used for the OAuth2 authentication method. This is the "
+            "end-point for the authentication server used to exchange "
+            "the authorization codes for a access token.",
+        ),
+        th.Property(
+            "redirect_uri",
+            th.StringType,
+            required=False,
+            description="Used for the OAuth2 authentication method. This is optional "
+            "as the redirect_uri may be part of the token returned by "
+            "the authentication server. If a redirect_uri is provided, "
+            "it determines where the API server redirects the user after "
+            "the user completes the authorization flow.",
+        ),
+        th.Property(
+            "oauth_extras",
+            th.ObjectType(),
+            required=False,
+            description="A object of Key/Value pairs for additional oauth config "
+            "parameters which may be required by the authorization server."
+            "Example: "
+            "{resource: https://analysis.windows.net/powerbi/api}.",
+        ),
+        th.Property(
+            "oauth_expiration_secs",
+            th.IntegerType,
+            default=None,
+            required=False,
+            description="Used for OAuth2 authentication method. This optional "
+            "setting is a timer for the expiration of a token in "
+            "seconds. If not set the OAuth will use the default "
+            "expiration set in the token by the authorization server.",
+        ),
+        th.Property(
+            "aws_credentials",
+            th.ObjectType(),
+            default=None,
+            required=False,
+            description="An object of aws credentials to authenticate to access AWS "
+            "services. This example is to access the AWS OpenSearch "
+            "service. Example: { aws_access_key_id: my_aws_key_id, "
+            "aws_secret_access_key: my_aws_secret_access_key, "
+            "aws_region: us-east-1, "
+            "aws_service: es, use_signed_credentials: true} ",
+        ),
+        th.Property(
+            "next_page_token_path",
+            th.StringType,
+            default=None,
+            required=False,
+            description="a jsonpath string representing the path to the 'next page' "
+            "token. Defaults to `$.next_page`",
+        ),
+        th.Property(
+            "pagination_request_style",
+            th.StringType,
+            default="default",
+            required=False,
+            description="the pagination style to use for requests. "
+            "Defaults to `default`",
+        ),
+        th.Property(
+            "pagination_response_style",
+            th.StringType,
+            default="default",
+            required=False,
+            description="the pagination style to use for response. "
+            "Defaults to `default`",
+        ),
+        th.Property(
+            "use_request_body_not_params",
+            th.BooleanType,
+            default=False,
+            required=False,
+            description="sends the request parameters in the request body."
+            "This is normally not required, a few API's like OpenSearch"
+            "require this. Defaults to `False`",
+        ),
+        th.Property(
+            "backoff_type",
+            th.StringType,
+            default=None,
+            required=False,
+            allowed_values=[None, "message", "header"],
+            description="The style of Backoff applied to rate limited APIs."
+            "None: Default Meltano SDK backoff_wait_generator, message: Scans "
+            "the response message for a time interval, header: retrieves the "
+            "backoff value from a header key response."
+            " Defaults to `None`",
+        ),
+        th.Property(
+            "backoff_param",
+            th.StringType,
+            default="Retry-After",
+            required=False,
+            description="The name of the key which contains a the "
+            "backoff value in the response. This is very applicable to backoff"
+            " values in headers. Defaults to `Retry-After`",
+        ),
+        th.Property(
+            "backoff_time_extension",
+            th.IntegerType,
+            default=0,
+            required=False,
+            description="A time extension (in seconds) to add to the backoff "
+            "value from the API plus jitter. Some APIs are not precise"
+            ", this adds an additional wait delay. Defaults to `0`",
+        ),
+        th.Property(
+            "store_raw_json_message",
+            th.BooleanType,
+            default=False,
+            required=False,
+            description="Adds an additional _SDC_RAW_JSON column as an "
+            "object. This will store the raw incoming message in this "
+            "column when provisioned. Useful for semi-structured records "
+            "when the schema is not well defined. Defaults to `False`",
+        ),
+        th.Property(
+            "pagination_page_size",
+            th.IntegerType,
+            default=None,
+            required=False,
+            description="the size of each page in records. Defaults to None",
+        ),
+        th.Property(
+            "pagination_results_limit",
+            th.IntegerType,
+            default=None,
+            required=False,
+            description="limits the max number of records. Defaults to None",
+        ),
+        th.Property(
+            "pagination_next_page_param",
+            th.StringType,
+            default=None,
+            required=False,
+            description="The name of the param that indicates the page/offset/cursor. "
+            "Defaults to None",
+        ),
+        th.Property(
+            "pagination_limit_per_page_param",
+            th.StringType,
+            default=None,
+            required=False,
+            description="The name of the param that indicates the limit/per_page. "
+            "Defaults to None",
+        ),
+        th.Property(
+            "pagination_total_limit_param",
+            th.StringType,
+            default="total",
+            required=False,
+            description="The name of the param that indicates the total limit e.g. "
+            "total, count. Defaults to total",
+        ),
+        th.Property(
+            "pagination_initial_offset",
+            th.IntegerType,
+            default=1,
+            required=False,
+            description="The initial offset to start pagination from. Defaults to 1",
+        ),
+        th.Property(
+            "offset_records_jsonpath",
+            th.StringType,
+            default=None,
+            required=False,
+            description="Optional jsonpath string representing the path in the results "
+            "Defaults to `None`.",
+        ),
     )
 
-    # extend top-level with the common stream fields
+    # add common properties to top-level properties
     for prop in common_properties.wrapped.values():
         top_level_properties.append(prop)
 
-    # stream schema entry (optional)
+    # --------------
+    # Stream schema
+    # --------------
     stream_properties = th.PropertiesList()
     stream_properties.wrapped = copy.copy(common_properties.wrapped)
-    stream_properties.append(th.Property("name", th.StringType, required=True))
+    stream_properties.append(
+        th.Property(
+            "name", th.StringType, required=True, description="name of the stream"
+        ),
+    )
     stream_properties.append(
         th.Property(
             "schema",
-            th.CustomType({"anyOf": [{"type": "string"}, {"type": "null"}, {"type": "object"}]}),
-            description="Singer schema dict OR a path to a JSON file containing a schema."
+            th.CustomType(
+                {"anyOf": [{"type": "string"}, {"type": "null"}, {"type:": "object"}]}
+            ),
+            required=False,
+            description="A valid Singer schema or a path-like string that provides "
+            "the path to a `.json` file that contains a valid Singer "
+            "schema. If provided, the schema will not be inferred from "
+            "the results of an api call.",
+        ),
+    )
+
+    # Allow per-stream pagination overrides & cursor handling.
+    stream_properties.append(
+        th.Property(
+            "next_page_token_path",
+            th.StringType,
+            required=False,
+            description="JSONPath for next-page token (e.g., '$.next_cursor').",
+        )
+    )
+    stream_properties.append(
+        th.Property(
+            "pagination_next_page_param",
+            th.StringType,
+            required=False,
+            description="Name of request param that carries the next-page token (e.g., 'cursor').",
+        )
+    )
+    stream_properties.append(
+        th.Property(
+            "pagination_limit_per_page_param",
+            th.StringType,
+            required=False,
+            description="Name of request param for page size (e.g., 'limit', 'per_page').",
+        )
+    )
+    stream_properties.append(
+        th.Property(
+            "pagination_page_size",
+            th.IntegerType,
+            required=False,
+            description="Page size for this stream only (overrides top-level).",
+        )
+    )
+    stream_properties.append(
+        th.Property(
+            "pagination_results_limit",
+            th.IntegerType,
+            required=False,
+            description="Max total records for this stream only (overrides top-level).",
         )
     )
 
+    # iteration_config support (usernames/hashtags/keywords or registry-driven).
+    stream_properties.append(
+        th.Property(
+            "iteration_config",
+            th.ObjectType(
+                th.Property(
+                    "iteration_type",
+                    th.StringType,
+                    required=False,
+                    description="Semantics only (usernames, hashtags, keywords, tweet_ids, registry).",
+                ),
+                th.Property(
+                    "values",
+                    th.ArrayType(th.StringType),
+                    required=False,
+                    description="Explicit set of values to iterate (e.g., handles or hashtags).",
+                ),
+                th.Property(
+                    "api_param_key",
+                    th.StringType,
+                    required=False,
+                    description="Request parameter name to set for each value (e.g., 'query', 'userName', 'tweetId').",
+                ),
+                th.Property(
+                    "api_param_template",
+                    th.StringType,
+                    required=False,
+                    description="String template to render the value (default '{value}').",
+                ),
+                th.Property(
+                    "metadata_key",
+                    th.StringType,
+                    required=False,
+                    description="Record key to inject for provenance (e.g., '_source_handle').",
+                ),
+                # Optional registry-driven fan-out (tweet IDs from earlier streams)
+                th.Property(
+                    "from_registry",
+                    th.StringType,
+                    required=False,
+                    description="State registry key to read values from (e.g., 'tweet_ids:twitter_timeline').",
+                ),
+                th.Property(
+                    "max_values",
+                    th.IntegerType,
+                    required=False,
+                    description="If from_registry is used, cap how many values to iterate.",
+                ),
+            ),
+            required=False,
+            description="Expand one logical stream into per-value concrete streams without custom code.",
+        )
+    )
+
+    # Minimal replication request adapter (Twitter-friendly).
+    stream_properties.append(
+        th.Property(
+            "replication_request_adapter",
+            th.ObjectType(
+                th.Property(
+                    "mode",
+                    th.StringType,
+                    required=True,
+                    description="add_query_suffix | param",
+                ),
+                th.Property(
+                    "key",
+                    th.StringType,
+                    required=True,
+                    description="Request param to mutate (e.g., 'query', 'sinceTime').",
+                ),
+                th.Property(
+                    "template",
+                    th.StringType,
+                    required=False,
+                    description="For add_query_suffix: e.g., ' since:${iso_utc}'.",
+                ),
+                th.Property(
+                    "transform",
+                    th.StringType,
+                    required=False,
+                    description="For mode=param: e.g., 'epoch_seconds'.",
+                ),
+            ),
+            required=False,
+            description="Lightweight adapter to append 'since:' suffixes or set 'sinceTime' epoch values.",
+        )
+    )
+
+    # Optional tweet-id registry capture on producing streams.
+    stream_properties.append(
+        th.Property(
+            "id_registry_config",
+            th.ObjectType(
+                th.Property(
+                    "registry_key",
+                    th.StringType,
+                    required=True,
+                    description="State registry key to store IDs under (e.g., 'tweet_ids:twitter_timeline').",
+                ),
+                th.Property(
+                    "id_path",
+                    th.StringType,
+                    required=False,
+                    description="JSONPath to extract the ID from the raw row (default: '$.id').",
+                ),
+                th.Property(
+                    "max_to_register_per_run",
+                    th.IntegerType,
+                    required=False,
+                    description="Max number of IDs to register in a single run for this stream.",
+                ),
+                th.Property(
+                    "min_like_count",
+                    th.IntegerType,
+                    required=False,
+                    description="Filter: only register IDs with likeCount >= this value.",
+                ),
+                th.Property(
+                    "min_view_count",
+                    th.IntegerType,
+                    required=False,
+                    description="Filter: only register IDs with viewCount >= this value.",
+                ),
+            ),
+            required=False,
+            description="Enable storing record IDs (e.g., tweet IDs) into Singer state "
+            "so downstream streams can iterate them without hardcoding.",
+        )
+    )
+
+    # add streams schema to top-level properties
     top_level_properties.append(
         th.Property(
             "streams",
             th.ArrayType(th.ObjectType(*stream_properties.wrapped.values())),
-        )
+            required=False,
+            description="An array of streams, designed for separate paths using the"
+            "same base url.",
+        ),
     )
 
     config_jsonschema = top_level_properties.to_dict()
 
-    # ---------- Discovery ----------
-    def _infer_schema(
+    # ----------------------
+    # Discovery and helpers
+    # ----------------------
+    def discover_streams(self) -> List[DynamicStream]:  # type: ignore
+        """Return a list of discovered streams.
+
+        Enhancements:
+        - Honors per-stream `next_page_token_path`, `pagination_*` overrides.
+        - Expands `iteration_config` into multiple concrete streams, injecting
+          optional provenance metadata (e.g., `_source_handle`).
+        - Applies minimal `replication_request_adapter`:
+            * mode=add_query_suffix → append " since:<ISO_UTC>" to a param
+            * mode=param (+ transform=epoch_seconds) → set a param value
+        - Supports registry-driven iteration (if `iteration_config.from_registry`
+          is provided) reading from `state["registry"][key]`.
+        - Passes `id_registry_config` into streams for ID capture (e.g., tweet IDs).
+        """
+        streams: List[DynamicStream] = []
+
+        def _resolve_dt(maybe_str: Any) -> Optional[datetime]:
+            """Parse an ISO string with optional 'Z' into a timezone-aware datetime."""
+            if not maybe_str:
+                return None
+            if isinstance(maybe_str, datetime):
+                return maybe_str
+            if isinstance(maybe_str, str):
+                try:
+                    return datetime.fromisoformat(maybe_str.replace("Z", "+00:00"))
+                except Exception:
+                    return None
+            return None
+
+        def _apply_replication_request_adapter(stream_cfg: dict, params: dict) -> None:
+            """Mutate params according to a minimal replication adapter.
+
+            Supported patterns for Twitter-style APIs:
+              - mode=add_query_suffix + key=<param> + template=" since:${iso_utc}"
+              - mode=param + key=<param> + transform=epoch_seconds
+            """
+            rra = stream_cfg.get("replication_request_adapter")
+            if not rra:
+                return
+            mode = rra.get("mode")
+            key = rra.get("key")
+            if not key:
+                return
+
+            since_dt = _resolve_dt(stream_cfg.get("start_date", self.config.get("start_date")))
+            if not since_dt:
+                return
+
+            if mode == "add_query_suffix":
+                template = rra.get("template", "")
+                suffix = template.replace("${iso_utc}", _iso_utc(since_dt))
+                if key in params and isinstance(params[key], str):
+                    params[key] = params[key] + suffix
+            elif mode == "param":
+                transform = rra.get("transform")
+                if transform == "epoch_seconds":
+                    params[key] = _epoch_seconds(since_dt)
+
+        def _make_stream(stream_cfg: dict, inject_meta: Optional[dict] = None) -> DynamicStream:
+            """Create a DynamicStream with fully-resolved per-stream settings."""
+            # Resolve config overlays
+            records_path = stream_cfg.get("records_path", self.config.get("records_path", "$[*]"))
+            except_keys = stream_cfg.get("except_keys", self.config.get("except_keys", []))
+            path = stream_cfg.get("path", self.config.get("path", ""))
+            params = {**self.config.get("params", {}), **stream_cfg.get("params", {})}
+            headers = {**self.config.get("headers", {}), **stream_cfg.get("headers", {})}
+            start_date = stream_cfg.get("start_date", self.config.get("start_date", ""))
+            replication_key = stream_cfg.get("replication_key", self.config.get("replication_key", ""))
+            source_search_field = stream_cfg.get("source_search_field", self.config.get("source_search_field", ""))
+            source_search_query = stream_cfg.get("source_search_query", self.config.get("source_search_query", ""))
+            offset_records_jsonpath = stream_cfg.get("offset_records_jsonpath", self.config.get("offset_records_jsonpath", None))
+
+            # Apply the minimal replication adapter (adds since suffix or param).
+            _apply_replication_request_adapter(stream_cfg, params)
+
+            # Schema resolution (unchanged default behavior)
+            schema: Dict[str, Any] = {}
+            schema_config = stream_cfg.get("schema")
+            if isinstance(schema_config, str):
+                self.logger.info("Found path to a schema, not doing discovery.")
+                with open(schema_config, "r") as f:
+                    schema = json.load(f)
+            elif isinstance(schema_config, dict):
+                self.logger.info("Found schema in config, not doing discovery.")
+                builder = SchemaBuilder()
+                builder.add_schema(schema_config)
+                schema = builder.to_schema()
+            else:
+                self.logger.info("No schema found. Inferring schema from API call.")
+                schema = self.get_schema(
+                    records_path,
+                    except_keys,
+                    stream_cfg.get("num_inference_records", self.config["num_inference_records"]),
+                    path,
+                    params,
+                    headers,
+                )
+
+            # Per-stream pagination overrides (fallback to top-level if absent).
+            next_page_token_path = stream_cfg.get("next_page_token_path", self.config.get("next_page_token_path"))
+            pagination_next_page_param = stream_cfg.get("pagination_next_page_param", self.config.get("pagination_next_page_param"))
+            pagination_limit_per_page_param = stream_cfg.get("pagination_limit_per_page_param", self.config.get("pagination_limit_per_page_param"))
+            pagination_page_size = stream_cfg.get("pagination_page_size", self.config.get("pagination_page_size"))
+            pagination_results_limit = stream_cfg.get("pagination_results_limit", self.config.get("pagination_results_limit"))
+
+            return DynamicStream(
+                tap=self,
+                name=stream_cfg["name"],
+                path=path,
+                params=params,
+                headers=headers,
+                records_path=records_path,
+                primary_keys=stream_cfg.get("primary_keys", self.config.get("primary_keys", [])),
+                replication_key=replication_key,
+                except_keys=except_keys,
+                next_page_token_path=next_page_token_path,  # critical for cursor pagination
+                pagination_request_style=self.config["pagination_request_style"],
+                pagination_response_style=self.config["pagination_response_style"],
+                pagination_page_size=pagination_page_size,
+                pagination_results_limit=pagination_results_limit,
+                pagination_next_page_param=pagination_next_page_param,           # 'cursor' for twitterapi.io
+                pagination_limit_per_page_param=pagination_limit_per_page_param,
+                pagination_total_limit_param=self.config.get("pagination_total_limit_param"),
+                pagination_initial_offset=self.config.get("pagination_initial_offset", 1),
+                offset_records_jsonpath=offset_records_jsonpath,
+                schema=schema,
+                start_date=start_date,
+                source_search_field=source_search_field,
+                source_search_query=source_search_query,
+                use_request_body_not_params=self.config.get("use_request_body_not_params"),
+                backoff_type=self.config.get("backoff_type"),
+                backoff_param=self.config.get("backoff_param"),
+                backoff_time_extension=self.config.get("backoff_time_extension"),
+                store_raw_json_message=self.config.get("store_raw_json_message"),
+                authenticator=self._authenticator,
+                inject_metadata=inject_meta or {},  # tag each record with provenance
+                id_registry_config=stream_cfg.get("id_registry_config", None),  # enable ID capture on producing streams
+            )
+
+        # ---- Main expansion loop: iteration_config → concrete streams ----
+        for base_stream in self.config["streams"]:
+            iter_cfg = base_stream.get("iteration_config")
+            if not iter_cfg:
+                # No iteration: build a single stream as-is.
+                streams.append(_make_stream(base_stream))
+                continue
+
+            values: List[Any] = []
+            inject_key = iter_cfg.get("metadata_key")   # e.g., "_source_handle"
+            api_param_key = iter_cfg.get("api_param_key")
+            api_param_template = iter_cfg.get("api_param_template", "{value}")
+
+            # Option A: Use explicit values from YAML (usernames/hashtags/keywords)
+            if "values" in iter_cfg and iter_cfg["values"]:
+                values = list(iter_cfg["values"])
+
+            # Option B: Pull values from registry in Singer state (optional, fan-out)
+            # Example: iteration_config:
+            #   from_registry: "tweet_ids:twitter_timeline"
+            #   max_values: 5
+            if not values and "from_registry" in iter_cfg:
+                reg_key = str(iter_cfg["from_registry"])
+                max_values = int(iter_cfg.get("max_values", 0)) or None
+                reg = self.state.get("registry", {})
+                seq = reg.get(reg_key, []) if isinstance(reg, dict) else []
+                # Ensure only simple JSON-serializable items (strings/ints)
+                cleaned = [x for x in seq if isinstance(x, (str, int))]
+                values = cleaned[:max_values] if max_values else cleaned
+
+            # If still no values or missing api_param_key, fall back to single stream.
+            if not values or not api_param_key:
+                streams.append(_make_stream(base_stream))
+                continue
+
+            # Materialize concrete streams for each value.
+            for val in values:
+                s = copy.deepcopy(base_stream)
+                # Distinct name per partition, without special chars that annoy targets.
+                safe_val = str(val).replace("#", "hash_").replace(" ", "_")
+                s["name"] = f"{base_stream['name']}__{safe_val}"
+                s.setdefault("params", {})
+                s["params"][api_param_key] = api_param_template.replace("{value}", str(val))
+
+                inject_meta = {inject_key: val} if inject_key else {}
+                streams.append(_make_stream(s, inject_meta=inject_meta))
+
+        return streams
+
+    # --------------------------
+    # Schema inference / helper
+    # --------------------------
+    def get_schema(
         self,
-        stream_cfg: Dict[str, Any],
         records_path: str,
         except_keys: list,
         inference_records: int,
         path: str,
         params: dict,
         headers: dict,
-        disable_probe: bool = False,
-    ) -> Dict[str, Any]:
-        """Attempt to infer schema safely, with graceful fallback."""
-        if disable_probe:
-            self.logger.info("Stream '%s': discovery probe disabled; using empty schema.", stream_cfg["name"])
-            return th.PropertiesList().to_dict()
+    ) -> Any:
+        """Infer schema from the first records returned by api. Creates a Stream object.
 
-        # If the endpoint requires a parameter which isn't present (e.g., userName),
-        # a probe would 400. Detect a required iteration key and provide the first value.
-        iter_cfg = stream_cfg.get("iteration_config") or {}
-        params = dict(params or {})
-        api_param_key = iter_cfg.get("api_param_key")
-        values = iter_cfg.get("values") or []
-        templ = iter_cfg.get("api_param_template", "{value}")
-        if api_param_key and values:
-            params.setdefault(api_param_key, templ.format(value=values[0]))
+        If auth_method is set, will call get_authenticator to obtain credentials
+        to issue a request to sample some records. The get_authenticator will:
+        - stores the authenticator in self._authenticator
+        - sets the self.http_auth if required by a given authenticator
+        - use an existing authenticator if one exists and is cached.
 
-        # Obtain auth if configured
-        auth_method = self.config.get("auth_method", "no_auth")
-        http_auth = None
-        if auth_method != "no_auth":
+        Args:
+            records_path: required - see config_jsonschema.
+            except_keys: required - see config_jsonschema.
+            inference_records: required - see config_jsonschema.
+            path: required - see config_jsonschema.
+            params: required - see config_jsonschema.
+            headers: required - see config_jsonschema.
+
+        Raises:
+            ValueError: if the response is not valid or a record is not valid json.
+
+        Returns:
+            A schema for the stream.
+
+        """
+        # TODO: this request format is not very robust
+
+        # Initialise Variables
+        auth_method = self.config.get("auth_method", "")
+        self.http_auth = None
+
+        if auth_method and not auth_method == "no_auth":
+            # Obtaining Authenticator for authorisation to obtain a schema.
             get_authenticator(self)
-            if auth_method == "oauth" and isinstance(self._authenticator, ConfigurableOAuthAuthenticator):
+
+            # Get an initial oauth token if an oauth method
+            if auth_method == "oauth" and isinstance(
+                self._authenticator, ConfigurableOAuthAuthenticator
+            ):
                 self._authenticator.get_initial_oauth_token()
+
             headers.update(getattr(self._authenticator, "auth_headers", {}))
             params.update(getattr(self._authenticator, "auth_params", {}))
-            http_auth = getattr(self, "http_auth", None)
 
-        url = (self.config["api_url"].rstrip("/") + path)
-        try:
-            r = requests.get(url, auth=http_auth, params=params, headers=headers, timeout=float(self.config.get("request_timeout_secs") or 30))
-            if not r.ok:
-                self.logger.error("Schema probe failed (%s): %s", f"{r.status_code} {r.reason}", (r.text or "")[:500])
-                # safe fallback: empty object schema (flatten_json will still emit)
-                return th.PropertiesList().to_dict()
+        r = requests.get(
+            self.config["api_url"] + path,
+            auth=self.http_auth,
+            params=params,
+            headers=headers,
+        )
+        if r.ok:
             records = extract_jsonpath(records_path, input=r.json())
-        except Exception as exc:
-            self.logger.exception("Schema probe error for %s", url)
-            # fallback
-            return th.PropertiesList().to_dict()
+        else:
+            self.logger.error(f"Error Connecting, message = {r.text}")
+            raise ValueError(r.text)
 
         builder = SchemaBuilder()
         builder.add_schema(th.PropertiesList().to_dict())
         for i, record in enumerate(records):
-            if not isinstance(record, dict):
-                # flatten non-dict values into a single value column
-                record = {"value": record}
-            flat = flatten_json(record, except_keys, store_raw_json_message=False)
-            builder.add_object(flat)
+            if type(record) is not dict:
+                self.logger.error("Input must be a dict object.")
+                raise ValueError("Input must be a dict object.")
+
+            flat_record = flatten_json(
+                record, except_keys, store_raw_json_message=False
+            )
+
+            builder.add_object(flat_record)
+            # Optional add _sdc_raw_json field to store the raw message
             if self.config.get("store_raw_json_message"):
                 builder.add_object({"_sdc_raw_json": {}})
-            if i >= int(inference_records or 50):
+
+            if i >= inference_records:
                 break
+
+        self.logger.debug(f"{builder.to_json(indent=2)}")
         return builder.to_schema()
-
-    def _merge_schema_overrides(self, stream_name: str, base_schema: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge user-provided schema fragments (e.g., to ensure replication_key presence)."""
-        overrides = (self.config.get("schema_overrides") or {}).get(stream_name)
-        if not overrides:
-            return base_schema
-        out = json.loads(json.dumps(base_schema))  # deep copy
-        # naive deep-merge
-        def merge(a, b):
-            for k, v in b.items():
-                if isinstance(v, dict) and isinstance(a.get(k), dict):
-                    merge(a[k], v)
-                else:
-                    a[k] = v
-        merge(out, overrides)
-        return out
-
-    def discover_streams(self) -> List[DynamicStream]:
-        streams: List[DynamicStream] = []
-        for s in self.config.get("streams", []):
-            # Resolve config precedence (stream overrides top-level)
-            path = s.get("path", self.config.get("path", ""))
-            params = {**(self.config.get("params") or {}), **(s.get("params") or {})}
-            headers = {**(self.config.get("headers") or {}), **(s.get("headers") or {})}
-            records_path = s.get("records_path", self.config.get("records_path", "$[*]"))
-            except_keys = s.get("except_keys", self.config.get("except_keys", []))
-            start_date = s.get("start_date", self.config.get("start_date"))
-            replication_key = s.get("replication_key", self.config.get("replication_key"))
-            offset_records_jsonpath = s.get("offset_records_jsonpath", self.config.get("offset_records_jsonpath"))
-
-            # schema selection
-            schema: Dict[str, Any] = {}
-            schema_cfg = s.get("schema")
-            disable_probe = bool(s.get("disable_discovery_probe", self.config.get("disable_discovery_probe", False)))
-            if isinstance(schema_cfg, str):
-                self.logger.info("Stream '%s': loading schema from file.", s["name"])
-                with open(schema_cfg, "r") as f:
-                    schema = json.load(f)
-            elif isinstance(schema_cfg, dict):
-                self.logger.info("Stream '%s': using inline schema.", s["name"])
-                schema = schema_cfg
-            else:
-                self.logger.info("Stream '%s': inferring schema from API", s["name"])
-                schema = self._infer_schema(
-                    stream_cfg=s,
-                    records_path=records_path,
-                    except_keys=except_keys,
-                    inference_records=int(s.get("num_inference_records", self.config.get("num_inference_records", 50))),
-                    path=path,
-                    params=params,
-                    headers=headers,
-                    disable_probe=disable_probe,
-                )
-
-            # merge overrides (e.g., to ensure replication_key fields and nullability)
-            schema = self._merge_schema_overrides(s["name"], schema)
-
-            streams.append(
-                DynamicStream(
-                    tap=self,
-                    name=s["name"],
-                    path=path,
-                    params=params,
-                    headers=headers,
-                    records_path=records_path,
-                    primary_keys=s.get("primary_keys", self.config.get("primary_keys", [])),
-                    replication_key=replication_key,
-                    except_keys=except_keys,
-                    next_page_token_path=s.get("next_page_token_path", self.config.get("next_page_token_path")),
-                    pagination_request_style=s.get("pagination_request_style", self.config.get("pagination_request_style", "default")),
-                    pagination_response_style=s.get("pagination_response_style", self.config.get("pagination_response_style", "default")),
-                    pagination_page_size=s.get("pagination_page_size", self.config.get("pagination_page_size")),
-                    pagination_results_limit=s.get("pagination_results_limit", self.config.get("pagination_results_limit")),
-                    pagination_next_page_param=s.get("pagination_next_page_param", self.config.get("pagination_next_page_param")),
-                    pagination_limit_per_page_param=s.get("pagination_limit_per_page_param", self.config.get("pagination_limit_per_page_param")),
-                    pagination_total_limit_param=s.get("pagination_total_limit_param", self.config.get("pagination_total_limit_param", "total")),
-                    pagination_initial_offset=s.get("pagination_initial_offset", self.config.get("pagination_initial_offset", 1)),
-                    offset_records_jsonpath=offset_records_jsonpath,
-                    schema=schema,
-                    start_date=start_date,
-                    source_search_field=s.get("source_search_field", self.config.get("source_search_field")),
-                    source_search_query=s.get("source_search_query", self.config.get("source_search_query")),
-                    use_request_body_not_params=s.get("use_request_body_not_params", self.config.get("use_request_body_not_params", False)),
-                    backoff_type=s.get("backoff_type", self.config.get("backoff_type")),
-                    backoff_param=s.get("backoff_param", self.config.get("backoff_param", "Retry-After")),
-                    backoff_time_extension=s.get("backoff_time_extension", self.config.get("backoff_time_extension", 0)),
-                    store_raw_json_message=s.get("store_raw_json_message", self.config.get("store_raw_json_message", False)),
-                    authenticator=self._authenticator,
-                    replication_request_adapter=s.get("replication_request_adapter"),
-                    disable_discovery_probe=disable_probe,
-                )
-            )
-        return streams

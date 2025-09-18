@@ -224,3 +224,4 @@ class RestAPIHeaderLinkPaginator(HeaderLinkPaginator):
             return parsed_url.query
 
         return None
+    
