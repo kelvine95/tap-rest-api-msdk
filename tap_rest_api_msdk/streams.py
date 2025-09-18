@@ -2,7 +2,7 @@
 
 import email.utils
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from string import Template
 from typing import Any, Dict, Generator, Iterable, Optional, Union, List, Set
 from urllib.parse import parse_qs, parse_qsl, urlparse
@@ -629,122 +629,140 @@ class DynamicStream(RestApiStream):
         yield from extract_jsonpath(self.records_path, input=response_data)
 
     def get_records(self, context: Optional[dict]) -> Iterable[Dict[str, Any]]:
-        """Override to handle Twitter-specific iteration logic.
-        
-        Args:
-            context: Stream context
-            
-        Yields:
-            Records from the API
-        """
-        # Twitter mode with special iteration logic
-        if self.twitter_mode:
-            yield from self._get_twitter_records(context)
-        else:
-            # Default behavior for non-Twitter APIs
+        """Override to handle Twitter-specific iteration logic."""
+        # Default behavior for non-Twitter APIs
+        if not self.twitter_mode:
             yield from super().get_records(context)
+            return
 
-    def _get_twitter_records(self, context: Optional[dict]) -> Iterable[Dict[str, Any]]:
-        """Get records with Twitter-specific logic.
-        
-        Args:
-            context: Stream context
-            
-        Yields:
-            Processed records
-        """
-        # Reset counter for this run
-        self._twitter_records_collected = 0
-        
-        # Handle different stream types
+        # Twitter mode
+        self._twitter_records_collected = 0  # reset per run
+
+        def remaining() -> int:
+            return max(0, int(self.twitter_max_per_run) - int(self._twitter_records_collected))
+
+        # helper to add sinceTime if available (integer epoch secs)
+        def add_since_time(p: dict) -> dict:
+            try:
+                last_sync = self.get_starting_timestamp(context)
+            except Exception:
+                last_sync = None
+            if last_sync:
+                try:
+                    p["sinceTime"] = int(last_sync.timestamp())
+                except Exception:
+                    # be conservative: skip sinceTime if conversion fails
+                    pass
+            return p
+
+        # --- user info ----------------------------------------------------------
         if self.twitter_stream_type == "user_info":
-            # Iterate through usernames for user info
             for username in self.twitter_usernames:
+                if remaining() <= 0:
+                    return
                 self._current_username = username
                 params = {"userName": username}
                 yield from self._fetch_with_params(params, context)
-                
-        elif self.twitter_stream_type == "user_tweets":
-            # Iterate through usernames for tweets
+            return
+
+        # --- user tweets --------------------------------------------------------
+        if self.twitter_stream_type == "user_tweets":
             for username in self.twitter_usernames:
+                if remaining() <= 0:
+                    return
                 self._current_username = username
-                params = {"userName": username, "includeReplies": False}
-                
-                # Add incremental loading
-                last_sync = self.get_starting_timestamp(context)
-                if last_sync:
-                    params["sinceTime"] = int(last_sync.timestamp())
-                
-                yield from self._fetch_with_pagination(params, context)
-                
-        elif self.twitter_stream_type == "mentions":
-            # Iterate through usernames for mentions
+                local = {"userName": username}
+                # includeReplies default False unless already provided at stream level
+                if "includeReplies" not in (self.params or {}):
+                    local["includeReplies"] = False
+                local = add_since_time(local)
+                yield from self._fetch_with_pagination(local, context)
+            return
+
+        # --- mentions -----------------------------------------------------------
+        if self.twitter_stream_type == "mentions":
             for username in self.twitter_usernames:
+                if remaining() <= 0:
+                    return
                 self._current_username = username
-                params = {"userName": username}
-                
-                # Add incremental loading
-                last_sync = self.get_starting_timestamp(context)
-                if last_sync:
-                    params["sinceTime"] = int(last_sync.timestamp())
-                
-                yield from self._fetch_with_pagination(params, context)
-                
-        elif self.twitter_stream_type == "hashtag_tweets":
-            # Iterate through hashtags
+                local = {"userName": username}
+                local = add_since_time(local)
+                yield from self._fetch_with_pagination(local, context)
+            return
+
+        # --- hashtag tweets (advanced search) -----------------------------------
+        if self.twitter_stream_type == "hashtag_tweets":
             for hashtag in self.twitter_hashtags:
+                if remaining() <= 0:
+                    return
                 self._current_hashtag = hashtag
-                query = f"#{hashtag}"
-                
-                # Add incremental loading
-                last_sync = self.get_starting_timestamp(context)
-                if last_sync:
-                    query += f" since:{last_sync.strftime('%Y-%m-%d')}"
-                
-                params = {"query": query, "queryType": "Latest"}
-                yield from self._fetch_with_pagination(params, context)
-                
-        elif self.twitter_stream_type in ["replies", "quotes"]:
-            # Get tweet IDs from parent streams
-            tweet_ids = set()
-            
-            # Get collected tweet IDs from tap instance
-            if self.tap_instance:
-                tweet_ids = self.tap_instance.get_collected_tweet_ids()
-            
-            # Also check for pending tweet IDs from previous runs
-            operation = "replies" if self.twitter_stream_type == "replies" else "quotes"
-            if self.tap_instance:
-                pending_ids = self.tap_instance.get_pending_tweet_ids(operation)
-                tweet_ids.update(pending_ids)
-            
-            # Process each tweet ID
-            for tweet_id in tweet_ids:
-                self._current_tweet_id = tweet_id
-                
-                if self.twitter_stream_type == "replies":
-                    params = {"tweetId": tweet_id}
-                else:  # quotes
-                    params = {"tweetId": tweet_id, "includeReplies": True}
-                
-                # Add incremental loading
-                last_sync = self.get_starting_timestamp(context)
-                if last_sync:
-                    params["sinceTime"] = int(last_sync.timestamp())
-                
+
+                # Build query; for incremental runs add since:YYYY-MM-DD_HH:MM:SS_UTC
+                q = f"#{hashtag}"
                 try:
-                    yield from self._fetch_with_pagination(params, context)
-                    # Mark as processed
+                    last_sync = self.get_starting_timestamp(context)
+                except Exception:
+                    last_sync = None
+                if last_sync:
+                    # Ensure UTC and full timestamp with _UTC suffix per API examples
+                    last_sync_utc = last_sync.astimezone(timezone.utc)
+                    q += f" since:{last_sync_utc.strftime('%Y-%m-%d_%H:%M:%S')}_UTC"
+
+                local = {"query": q, "queryType": "Latest"}
+                yield from self._fetch_with_pagination(local, context)
+            return
+
+        # --- replies & quotes (dependent on collected tweet ids) ----------------
+        if self.twitter_stream_type in {"replies", "quotes"}:
+            operation = "replies" if self.twitter_stream_type == "replies" else "quotes"
+
+            tweet_ids: Set[str] = set()
+            if self.tap_instance:
+                try:
+                    tweet_ids |= set(self.tap_instance.get_collected_tweet_ids())
+                except Exception:
+                    pass
+                try:
+                    tweet_ids |= set(self.tap_instance.get_pending_tweet_ids(operation))
+                except Exception:
+                    pass
+
+            for tweet_id in tweet_ids:
+                if remaining() <= 0:
+                    return
+
+                self._current_tweet_id = tweet_id
+                if self.twitter_stream_type == "replies":
+                    local = {"tweetId": tweet_id}
+                else:
+                    # API defaults includeReplies=True for quotes; we won't force it unless user configured
+                    local = {"tweetId": tweet_id}
+
+                local = add_since_time(local)
+
+                try:
+                    yield from self._fetch_with_pagination(local, context)
                     if self.tap_instance:
-                        self.tap_instance.remove_pending_tweet_id(tweet_id, operation)
-                except Exception as e:
-                    # Keep as pending for next run
+                        try:
+                            self.tap_instance.remove_pending_tweet_id(tweet_id, operation)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    # keep as pending for next run
                     if self.tap_instance:
-                        self.tap_instance.add_pending_tweet_id(tweet_id, operation)
-                    self.logger.warning(f"Failed to process tweet {tweet_id}: {e}")
-        else:
-            # Fallback to default behavior
-            yield from super().get_records(context)
+                        try:
+                            self.tap_instance.add_pending_tweet_id(tweet_id, operation)
+                        except Exception:
+                            pass
+                    self.logger.warning("Failed to process %s for tweet %s: %s",
+                                        operation, tweet_id, exc)
+            return
+
+        # --- unknown twitter stream type -> fallback to default -----------------
+        self.logger.debug("Unknown twitter_stream_type=%s; using default behavior.",
+                        self.twitter_stream_type)
+        yield from super().get_records(context)
+
 
     def _fetch_with_params(self, params: dict, context: Optional[dict]) -> Iterable[dict]:
         """Fetch records with specific parameters."""
