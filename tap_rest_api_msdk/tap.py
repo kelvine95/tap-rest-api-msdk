@@ -1,736 +1,300 @@
-"""rest-api tap class."""
+# tap.py
+"""Generic REST tap with optional TwitterAPI helpers (backward compatible)."""
+
+from __future__ import annotations
 
 import copy
 import json
-from typing import Any, List, Optional, Dict, Set
-from datetime import datetime
-import requests
+from typing import Any, Dict, List, Optional, Set
+
 from genson import SchemaBuilder
 from singer_sdk import Tap
 from singer_sdk import typing as th
 from singer_sdk.authenticators import APIAuthenticatorBase
 from singer_sdk.helpers.jsonpath import extract_jsonpath
-from tap_rest_api_msdk.auth import ConfigurableOAuthAuthenticator, get_authenticator
+
 from tap_rest_api_msdk.streams import DynamicStream
 from tap_rest_api_msdk.utils import flatten_json
+from tap_rest_api_msdk.auth import (
+    ConfigurableOAuthAuthenticator,
+    get_authenticator,
+)
 
 
 class TapRestApiMsdk(Tap):
-    """rest-api tap class."""
+    """REST tap supporting dynamic streams with optional Twitter special-casing."""
 
     name = "tap-rest-api-msdk"
 
-    # Required for Authentication in tap.py - function APIAuthenticatorBase
-    tap_name = name
-
-    # Used to cache the Authenticator to prevent over hitting the Authentication
-    # end-point for each stream.
+    # cache authenticator across streams
     _authenticator: Optional[APIAuthenticatorBase] = None
-    
-    # Twitter-specific state tracking
-    _twitter_collected_tweet_ids: Set[str] = set()
-    _twitter_pending_operations: Dict[str, Set[str]] = {"replies": set(), "quotes": set()}
+    http_auth = None
 
+    # Twitter in-memory state (used only if twitter_stream_type is provided)
+    _tw_collected_tweet_ids: Set[str] = set()
+    _tw_pending_ops: Dict[str, Set[str]] = {"replies": set(), "quotes": set()}
+
+    # ---- Common per-stream config schema (BACKWARD COMPATIBLE) ----
     common_properties = th.PropertiesList(
-        th.Property(
-            "path",
-            th.StringType,
-            required=False,
-            description="the path appended to the `api_url`. Stream-level path will "
-            "overwrite top-level path",
-        ),
-        th.Property(
-            "params",
-            th.ObjectType(),
-            default={},
-            required=False,
-            description="an object providing the `params` in a `requests.get` method. "
-            "Stream level params will be merged"
-            "with top-level params with stream level params overwriting"
-            "top-level params with the same key.",
-        ),
-        th.Property(
-            "headers",
-            th.ObjectType(),
-            required=False,
-            description="An object of headers to pass into the api calls. Stream level"
-            "headers will be merged with top-level params with stream"
-            "level params overwriting top-level params with the same key.",
-        ),
-        th.Property(
-            "records_path",
-            th.StringType,
-            required=False,
-            description="a jsonpath string representing the path in the requests "
-            "response that contains the records to process. Defaults "
-            "to `$[*]`. Stream level records_path will overwrite "
-            "the top-level records_path",
-        ),
-        th.Property(
-            "primary_keys",
-            th.ArrayType(th.StringType),
-            required=False,
-            description="a list of the json keys of the primary key for the stream.",
-        ),
-        th.Property(
-            "replication_key",
-            th.StringType,
-            required=False,
-            description="the json response field representing the replication key."
-            "Note that this should be an incrementing integer or datetime object.",
-        ),
-        th.Property(
-            "except_keys",
-            th.ArrayType(th.StringType),
-            default=[],
-            required=False,
-            description="This tap automatically flattens the entire json structure "
-            "and builds keys based on the corresponding paths.; Keys, "
-            "whether composite or otherwise, listed in this dictionary "
-            "will not be recursively flattened, but instead their values "
-            "will be; turned into a json string and processed in that "
-            "format. This is also automatically done for any lists within "
-            "the records; therefore, records are not duplicated for each "
-            "item in lists.",
-        ),
-        th.Property(
-            "num_inference_records",
-            th.NumberType,
-            default=50,
-            required=False,
-            description="number of records used to infer the stream's schema. "
-            "Defaults to 50.",
-        ),
-        th.Property(
-            "start_date",
-            th.DateTimeType,
-            required=False,
-            description="An optional field. Normally required when using the"
-            "replication_key. This is the initial starting date when using a"
-            "date based replication key and there is no state available.",
-        ),
-        th.Property(
-            "source_search_field",
-            th.StringType,
-            required=False,
-            description="An optional field name which can be used for querying "
-            "specific records from supported API's. The intend for this "
-            "parameter is to continue incrementally processing from a "
-            "previous state. Example `last-updated`. Note: You must also "
-            "set the replication_key, where the replication_key isjson "
-            "response representation of the API `source_search_field`. "
-            "You shouldalso supply the `source_search_query`, "
-            "`replication_key` and `start_date`.",
-        ),
-        th.Property(
-            "source_search_query",
-            th.StringType,
-            required=False,
-            description="An optional query template to be issued against the API."
-            "Substitute the query field you are querying against with "
-            "$last_run_date. Atrun-time, the tap will dynamically update "
-            "the token with either the `start_date`or the last bookmark / "
-            "state value. A simple template Example for FHIR API's: "
-            "gt$last_run_date. A more complex example against an "
-            "Opensearch API, "
-            '{"bool": {"filter": [{"range": '
-            '{ "meta.lastUpdated": { "gt": "$last_run_date" }}}] }} .'
-            "Note: Any required double quotes in the query template must "
-            "be escaped.",
-        ),
-        # Twitter-specific properties
-        th.Property(
-            "twitter_mode",
-            th.BooleanType,
-            default=False,
-            required=False,
-            description="Enable Twitter-specific features like automatic tweet ID propagation",
-        ),
-        th.Property(
-            "twitter_usernames",
-            th.ArrayType(th.StringType),
-            required=False,
-            description="List of Twitter usernames to track (Twitter mode only)",
-        ),
-        th.Property(
-            "twitter_hashtags",
-            th.ArrayType(th.StringType),
-            required=False,
-            description="List of hashtags to track (Twitter mode only)",
-        ),
-        th.Property(
-            "twitter_stream_type",
-            th.StringType,
-            required=False,
-            description="Type of Twitter stream: user_tweets, mentions, hashtag_tweets, replies, quotes",
-        ),
-        th.Property(
-            "twitter_parent_streams",
-            th.ArrayType(th.StringType),
-            required=False,
-            description="Parent streams to get tweet IDs from (for replies/quotes streams)",
-        ),
-        th.Property(
-            "twitter_max_per_run",
-            th.IntegerType,
-            default=20,
-            required=False,
-            description="Maximum records to fetch per run (Twitter mode only)",
-        ),
+        th.Property("name", th.StringType, description="Stream name."),
+        th.Property("path", th.StringType, required=False),
+        th.Property("records_path", th.StringType, required=False, description="JSONPath"),
+        th.Property("params", th.ObjectType(), required=False, default={}),
+        th.Property("headers", th.ObjectType(), required=False, default={}),
+        th.Property("primary_keys", th.ArrayType(th.StringType), required=False, default=[]),
+        th.Property("replication_key", th.StringType, required=False),
+        th.Property("except_keys", th.ArrayType(th.StringType), required=False, default=[]),
+        th.Property("num_inference_records", th.IntegerType, required=False, default=50),
+        th.Property("start_date", th.DateTimeType, required=False),
+        th.Property("source_search_field", th.StringType, required=False),
+        th.Property("source_search_query", th.StringType, required=False),
+        th.Property("offset_records_jsonpath", th.StringType, required=False),
+
+        # Pagination knobs (preserve legacy names)
+        th.Property("next_page_token_path", th.StringType, required=False),
+        th.Property("pagination_request_style", th.StringType, required=False, default="default"),
+        th.Property("pagination_response_style", th.StringType, required=False, default="default"),
+        th.Property("pagination_page_size", th.IntegerType, required=False),
+        th.Property("pagination_results_limit", th.IntegerType, required=False),
+        th.Property("pagination_next_page_param", th.StringType, required=False),
+        th.Property("pagination_limit_per_page_param", th.StringType, required=False),
+        th.Property("pagination_total_limit_param", th.StringType, required=False, default="total"),
+        th.Property("pagination_initial_offset", th.IntegerType, required=False, default=1),
+
+        # Backoff & extras
+        th.Property("use_request_body_not_params", th.BooleanType, required=False, default=False),
+        th.Property("backoff_type", th.StringType, required=False, allowed_values=[None, "message", "header"]),
+        th.Property("backoff_param", th.StringType, required=False, default="Retry-After"),
+        th.Property("backoff_time_extension", th.IntegerType, required=False, default=0),
+        th.Property("store_raw_json_message", th.BooleanType, required=False, default=False),
+
+        # Twitter routing (optional)
+        th.Property("twitter_stream_type", th.StringType, required=False),
+        th.Property("twitter_usernames", th.ArrayType(th.StringType), required=False),
+        th.Property("twitter_hashtags", th.ArrayType(th.StringType), required=False),
+        th.Property("twitter_parent_streams", th.ArrayType(th.StringType), required=False),
+        th.Property("twitter_max_per_run", th.IntegerType, required=False, default=20),
     )
 
+    # ---- Top-level config schema ----
     top_level_properties = th.PropertiesList(
-        th.Property(
-            "api_url",
-            th.StringType,
-            required=True,
-            description="the base url/endpoint for the desired api",
-        ),
+        th.Property("api_url", th.StringType, required=True, description="Base URL"),
         th.Property(
             "auth_method",
             th.StringType,
-            default="no_auth",
             required=False,
-            description="The method of authentication used by the API. Supported "
-            "options include oauth: for OAuth2 authentication, basic: "
-            "Basic Header authorization - base64-encoded username + "
-            "password config items, api_key: for API Keys in the header "
-            "e.g. X-API-KEY,bearer_token: for Bearer token authorization, "
-            "aws: for AWS Authentication.Defaults to no_auth which will "
-            "take authentication parameters passed via the headersconfig.",
+            default="no_auth",
+            description="one of: no_auth, api_key, bearer_token, basic, oauth, aws",
         ),
+        # SINGLE place to define API key(s). No duplication required.
         th.Property(
             "api_keys",
             th.ObjectType(),
             required=False,
-            description="A object of API Key/Value pairs used by the api_key auth "
-            "method Example: { X-API-KEY: my secret value}.",
+            description="Header-style API keys, e.g. {\"X-API-Key\":\"<key>\"}",
         ),
-        th.Property(
-            "client_id",
-            th.StringType,
-            required=False,
-            description="Used for the OAuth2 authentication method. The public "
-            "application ID that's assigned for Authentication. The "
-            "client_id should accompany a client_secret.",
-        ),
-        th.Property(
-            "client_secret",
-            th.StringType,
-            required=False,
-            description="Used for the OAuth2 authentication method. The client_secret "
-            "is a secret known only to the application and the "
-            "authorization server. It is essential the application's "
-            "own password.",
-        ),
-        th.Property(
-            "username",
-            th.StringType,
-            required=False,
-            description="Used for a number of authentication methods that use a user "
-            "password combination for authentication.",
-        ),
-        th.Property(
-            "password",
-            th.StringType,
-            required=False,
-            description="Used for a number of authentication methods that use a user "
-            "password combination for authentication.",
-        ),
-        th.Property(
-            "bearer_token",
-            th.StringType,
-            required=False,
-            description="Used for the Bearer Authentication method, which uses a token "
-            "as part of the authorization header for authentication.",
-        ),
-        th.Property(
-            "refresh_token",
-            th.StringType,
-            required=False,
-            description="An OAuth2 Refresh Token is a string that the OAuth2 "
-            "client can use to get a new access token without the user's "
-            "interaction.",
-        ),
-        th.Property(
-            "grant_type",
-            th.StringType,
-            required=False,
-            description="Used for the OAuth2 authentication method. The grant_type "
-            "is required to describe the OAuth2 flow. Flows support by "
-            "this tap include client_credentials, refresh_token, password.",
-        ),
-        th.Property(
-            "scope",
-            th.StringType,
-            required=False,
-            description="Used for the OAuth2 authentication method. The scope is "
-            "optional, it is a mechanism to limit the amount of access "
-            "that is granted to an access token. One or more scopes can "
-            "be provided delimited by a space.",
-        ),
-        th.Property(
-            "access_token_url",
-            th.StringType,
-            required=False,
-            description="Used for the OAuth2 authentication method. This is the "
-            "end-point for the authentication server used to exchange "
-            "the authorization codes for a access token.",
-        ),
-        th.Property(
-            "redirect_uri",
-            th.StringType,
-            required=False,
-            description="Used for the OAuth2 authentication method. This is optional "
-            "as the redirect_uri may be part of the token returned by "
-            "the authentication server. If a redirect_uri is provided, "
-            "it determines where the API server redirects the user after "
-            "the user completes the authorization flow.",
-        ),
-        th.Property(
-            "oauth_extras",
-            th.ObjectType(),
-            required=False,
-            description="A object of Key/Value pairs for additional oauth config "
-            "parameters which may be required by the authorization server."
-            "Example: "
-            "{resource: https://analysis.windows.net/powerbi/api}.",
-        ),
-        th.Property(
-            "oauth_expiration_secs",
-            th.IntegerType,
-            default=None,
-            required=False,
-            description="Used for OAuth2 authentication method. This optional "
-            "setting is a timer for the expiration of a token in "
-            "seconds. If not set the OAuth will use the default "
-            "expiration set in the token by the authorization server.",
-        ),
-        th.Property(
-            "aws_credentials",
-            th.ObjectType(),
-            default=None,
-            required=False,
-            description="An object of aws credentials to authenticate to access AWS "
-            "services. This example is to access the AWS OpenSearch "
-            "service. Example: { aws_access_key_id: my_aws_key_id, "
-            "aws_secret_access_key: my_aws_secret_access_key, "
-            "aws_region: us-east-1, "
-            "aws_service: es, use_signed_credentials: true} ",
-        ),
-        th.Property(
-            "next_page_token_path",
-            th.StringType,
-            default=None,
-            required=False,
-            description="a jsonpath string representing the path to the 'next page' "
-            "token. Defaults to `$.next_page`",
-        ),
-        th.Property(
-            "pagination_request_style",
-            th.StringType,
-            default="default",
-            required=False,
-            description="the pagination style to use for requests. "
-            "Defaults to `default`",
-        ),
-        th.Property(
-            "pagination_response_style",
-            th.StringType,
-            default="default",
-            required=False,
-            description="the pagination style to use for response. "
-            "Defaults to `default`",
-        ),
-        th.Property(
-            "use_request_body_not_params",
-            th.BooleanType,
-            default=False,
-            required=False,
-            description="sends the request parameters in the request body."
-            "This is normally not required, a few API's like OpenSearch"
-            "require this. Defaults to `False`",
-        ),
-        th.Property(
-            "backoff_type",
-            th.StringType,
-            default=None,
-            required=False,
-            allowed_values=[None, "message", "header"],
-            description="The style of Backoff applied to rate limited APIs."
-            "None: Default Meltano SDK backoff_wait_generator, message: Scans "
-            "the response message for a time interval, header: retrieves the "
-            "backoff value from a header key response."
-            " Defaults to `None`",
-        ),
-        th.Property(
-            "backoff_param",
-            th.StringType,
-            default="Retry-After",
-            required=False,
-            description="The name of the key which contains a the "
-            "backoff value in the response. This is very applicable to backoff"
-            " values in headers. Defaults to `Retry-After`",
-        ),
-        th.Property(
-            "backoff_time_extension",
-            th.IntegerType,
-            default=0,
-            required=False,
-            description="A time extension (in seconds) to add to the backoff "
-            "value from the API plus jitter. Some APIs are not precise"
-            ", this adds an additional wait delay. Defaults to `0`",
-        ),
-        th.Property(
-            "store_raw_json_message",
-            th.BooleanType,
-            default=False,
-            required=False,
-            description="Adds an additional _SDC_RAW_JSON column as an "
-            "object. This will store the raw incoming message in this "
-            "column when provisioned. Useful for semi-structured records "
-            "when the schema is not well defined. Defaults to `False`",
-        ),
-        th.Property(
-            "pagination_page_size",
-            th.IntegerType,
-            default=None,
-            required=False,
-            description="the size of each page in records. Defaults to None",
-        ),
-        th.Property(
-            "pagination_results_limit",
-            th.IntegerType,
-            default=None,
-            required=False,
-            description="limits the max number of records. Defaults to None",
-        ),
-        th.Property(
-            "pagination_next_page_param",
-            th.StringType,
-            default=None,
-            required=False,
-            description="The name of the param that indicates the page/offset. "
-            "Defaults to None",
-        ),
-        th.Property(
-            "pagination_limit_per_page_param",
-            th.StringType,
-            default=None,
-            required=False,
-            description="The name of the param that indicates the limit/per_page. "
-            "Defaults to None",
-        ),
-        th.Property(
-            "pagination_total_limit_param",
-            th.StringType,
-            default="total",
-            required=False,
-            description="The name of the param that indicates the total limit e.g. "
-            "total, count. Defaults to total",
-        ),
-        th.Property(
-            "pagination_initial_offset",
-            th.IntegerType,
-            default=1,
-            required=False,
-            description="The initial offset to start pagination from. Defaults to 1",
-        ),
-        th.Property(
-            "offset_records_jsonpath",
-            th.StringType,
-            default=None,
-            required=False,
-            description="Optional jsonpath string representing the path in the results "
-            "Defaults to `None`.",
-        ),
-    )
+        th.Property("headers", th.ObjectType(), required=False, default={}, description="Global headers"),
+        th.Property("params", th.ObjectType(), required=False, default={}, description="Global query params"),
 
-    # add common properties to top-level properties
-    for prop in common_properties.wrapped.values():
-        top_level_properties.append(prop)
+        # OAuth/bearer/basic/etc supported via existing helpers
+        th.Property("client_id", th.StringType, required=False),
+        th.Property("client_secret", th.StringType, required=False),
+        th.Property("username", th.StringType, required=False),
+        th.Property("password", th.StringType, required=False),
+        th.Property("bearer_token", th.StringType, required=False),
+        th.Property("refresh_token", th.StringType, required=False),
+        th.Property("grant_type", th.StringType, required=False),
+        th.Property("scope", th.StringType, required=False),
+        th.Property("access_token_url", th.StringType, required=False),
+        th.Property("redirect_uri", th.StringType, required=False),
+        th.Property("oauth_extras", th.ObjectType(), required=False),
+        th.Property("oauth_expiration_secs", th.IntegerType, required=False),
 
-    # add common properties to the stream schema
-    stream_properties = th.PropertiesList()
-    stream_properties.wrapped = copy.copy(common_properties.wrapped)
-    stream_properties.append(
-        th.Property(
-            "name", th.StringType, required=True, description="name of the stream"
-        ),
-    )
-    stream_properties.append(
-        th.Property(
-            "schema",
-            th.CustomType(
-                {"anyOf": [{"type": "string"}, {"type": "null"}, {"type:": "object"}]}
-            ),
-            required=False,
-            description="A valid Singer schema or a path-like string that provides "
-            "the path to a `.json` file that contains a valid Singer "
-            "schema. If provided, the schema will not be inferred from "
-            "the results of an api call.",
-        ),
-    )
+        # Pagination defaults (can be overridden per-stream)
+        th.Property("next_page_token_path", th.StringType, required=False),
+        th.Property("pagination_request_style", th.StringType, required=False, default="default"),
+        th.Property("pagination_response_style", th.StringType, required=False, default="default"),
+        th.Property("pagination_page_size", th.IntegerType, required=False),
+        th.Property("pagination_results_limit", th.IntegerType, required=False),
+        th.Property("pagination_next_page_param", th.StringType, required=False),
+        th.Property("pagination_limit_per_page_param", th.StringType, required=False),
+        th.Property("pagination_total_limit_param", th.StringType, required=False, default="total"),
+        th.Property("pagination_initial_offset", th.IntegerType, required=False, default=1),
+        th.Property("offset_records_jsonpath", th.StringType, required=False),
 
-    # add streams schema to top-level properties
-    top_level_properties.append(
+        th.Property("use_request_body_not_params", th.BooleanType, required=False, default=False),
+        th.Property("backoff_type", th.StringType, required=False, allowed_values=[None, "message", "header"]),
+        th.Property("backoff_param", th.StringType, required=False, default="Retry-After"),
+        th.Property("backoff_time_extension", th.IntegerType, required=False, default=0),
+        th.Property("store_raw_json_message", th.BooleanType, required=False, default=False),
+
+        # Twitter top-level defaults (optional)
+        th.Property("twitter_usernames", th.ArrayType(th.StringType), required=False),
+        th.Property("twitter_hashtags", th.ArrayType(th.StringType), required=False),
+
+        # Dynamic stream array (legacy compatible)
         th.Property(
             "streams",
-            th.ArrayType(th.ObjectType(*stream_properties.wrapped.values())),
+            th.ArrayType(th.ObjectType(*common_properties.wrapped.values())),
             required=False,
-            description="An array of streams, designed for separate paths using the"
-            "same base url.",
+            description="Dynamic stream definitions.",
         ),
     )
 
+    # publish config jsonschema
     config_jsonschema = top_level_properties.to_dict()
 
-    def discover_streams(self) -> List[DynamicStream]:  # type: ignore
-        """Return a list of discovered streams.
+    # ----------------- Discovery -----------------
+    def discover_streams(self) -> List[DynamicStream]:
+        streams: List[DynamicStream] = []
 
-        Returns:
-            A list of streams.
+        for s in self.config.get("streams", []):
+            # merge per-stream with top-level for headers/params
+            headers = {**self.config.get("headers", {}), **s.get("headers", {})}
+            # inject API keys exactly once here (no double entry!)
+            for hk, hv in (self.config.get("api_keys") or {}).items():
+                headers.setdefault(hk, hv)
 
-        """
-        streams = []
-        
-        # Check if Twitter mode is enabled
-        twitter_mode = self.config.get("twitter_mode", False)
+            params = {**self.config.get("params", {}), **s.get("params", {})}
 
-        auth_method = self.config.get("auth_method", "")
-        if auth_method and auth_method != "no_auth" and self._authenticator is None:
-            get_authenticator(self)
-        
-        for stream in self.config["streams"]:
-            # resolve config
-            records_path = stream.get(
-                "records_path", self.config.get("records_path", "$[*]")
-            )
-            except_keys = stream.get("except_keys", self.config.get("except_keys", []))
-            path = stream.get("path", self.config.get("path", ""))
-            params = {**self.config.get("params", {}), **stream.get("params", {})}
-            headers = {**self.config.get("headers", {}), **stream.get("headers", {})}
-            start_date = stream.get("start_date", self.config.get("start_date", ""))
-            replication_key = stream.get(
-                "replication_key", self.config.get("replication_key", "")
-            )
-            source_search_field = stream.get(
-                "source_search_field", self.config.get("source_search_field", "")
-            )
-            source_search_query = stream.get(
-                "source_search_query", self.config.get("source_search_query", "")
-            )
-            offset_records_jsonpath = stream.get(
-                "offset_records_jsonpath",
-                self.config.get("offset_records_jsonpath", None),
-            )
-
-            schema = {}
-            schema_config = stream.get("schema")
-            if isinstance(schema_config, str):
-                self.logger.info("Found path to a schema, not doing discovery.")
-                with open(schema_config, "r") as f:
+            # schema resolution
+            schema: Dict[str, Any]
+            schema_cfg = s.get("schema")
+            if isinstance(schema_cfg, str):
+                with open(schema_cfg, "r") as f:
                     schema = json.load(f)
-
-            elif isinstance(schema_config, dict):
-                self.logger.info("Found schema in config, not doing discovery.")
-                builder = SchemaBuilder()
-                builder.add_schema(schema_config)
-                schema = builder.to_schema()
-
+            elif isinstance(schema_cfg, dict):
+                b = SchemaBuilder()
+                b.add_schema(schema_cfg)
+                schema = b.to_schema()
             else:
-                self.logger.info("No schema found. Inferring schema from API call.")
-                schema = self.get_schema(
-                    records_path,
-                    except_keys,
-                    stream.get(
-                        "num_inference_records",
-                        self.config.get("num_inference_records", 50),
-                    ),
-                    path,
-                    params,
-                    headers,
+                # infer schema with one sample request, if possible
+                schema = self._infer_schema(
+                    path=s.get("path", ""),
+                    headers=headers.copy(),
+                    params=params.copy(),
+                    records_path=s.get("records_path", "$[*]"),
+                    except_keys=s.get("except_keys", []),
+                    max_records=int(s.get("num_inference_records", 50)),
                 )
-
-            # Pass Twitter-specific config to stream if enabled
-            twitter_config = {}
-            if twitter_mode:
-                twitter_config = {
-                    "twitter_mode": True,
-                    "twitter_usernames": stream.get("twitter_usernames", 
-                                                   self.config.get("twitter_usernames", [])),
-                    "twitter_hashtags": stream.get("twitter_hashtags", 
-                                                  self.config.get("twitter_hashtags", [])),
-                    "twitter_stream_type": stream.get("twitter_stream_type", 
-                                                     self.config.get("twitter_stream_type", "")),
-                    "twitter_parent_streams": stream.get("twitter_parent_streams",
-                                                        self.config.get("twitter_parent_streams", [])),
-                    "twitter_max_per_run": stream.get("twitter_max_per_run",
-                                                     self.config.get("twitter_max_per_run", 20)),
-                    "tap_instance": self,  # Pass tap instance for state sharing
-                }
 
             streams.append(
                 DynamicStream(
                     tap=self,
-                    name=stream["name"],
-                    path=path,
+                    name=s["name"],
+                    path=s.get("path", ""),
+                    records_path=s.get("records_path", "$[*]"),
                     params=params,
                     headers=headers,
-                    records_path=records_path,
-                    primary_keys=stream.get(
-                        "primary_keys", self.config.get("primary_keys", [])
-                    ),
-                    replication_key=replication_key,
-                    except_keys=except_keys,
-                    next_page_token_path=self.config.get("next_page_token_path"),
-                    pagination_request_style=self.config["pagination_request_style"],
-                    pagination_response_style=self.config.get("pagination_response_style", "default"),
-                    pagination_page_size=self.config.get("pagination_page_size"),
-                    pagination_results_limit=self.config.get(
-                        "pagination_results_limit"
-                    ),
-                    pagination_next_page_param=self.config.get(
-                        "pagination_next_page_param"
-                    ),
-                    pagination_limit_per_page_param=self.config.get(
-                        "pagination_limit_per_page_param"
-                    ),
-                    pagination_total_limit_param=self.config.get(
-                        "pagination_total_limit_param"
-                    ),
-                    pagination_initial_offset=self.config.get(
-                        "pagination_initial_offset",
-                        1,
-                    ),
-                    offset_records_jsonpath=offset_records_jsonpath,
+                    primary_keys=s.get("primary_keys", []),
+                    replication_key=s.get("replication_key"),
+                    except_keys=s.get("except_keys", []),
+                    next_page_token_path=s.get("next_page_token_path", self.config.get("next_page_token_path")),
+                    pagination_request_style=s.get("pagination_request_style", self.config.get("pagination_request_style", "default")),
+                    pagination_response_style=s.get("pagination_response_style", self.config.get("pagination_response_style", "default")),
+                    pagination_page_size=s.get("pagination_page_size", self.config.get("pagination_page_size")),
+                    pagination_results_limit=s.get("pagination_results_limit", self.config.get("pagination_results_limit")),
+                    pagination_next_page_param=s.get("pagination_next_page_param", self.config.get("pagination_next_page_param")),
+                    pagination_limit_per_page_param=s.get("pagination_limit_per_page_param", self.config.get("pagination_limit_per_page_param")),
+                    pagination_total_limit_param=s.get("pagination_total_limit_param", self.config.get("pagination_total_limit_param", "total")),
+                    pagination_initial_offset=s.get("pagination_initial_offset", self.config.get("pagination_initial_offset", 1)),
+                    offset_records_jsonpath=s.get("offset_records_jsonpath", self.config.get("offset_records_jsonpath")),
                     schema=schema,
-                    start_date=start_date,
-                    source_search_field=source_search_field,
-                    source_search_query=source_search_query,
-                    use_request_body_not_params=self.config.get(
-                        "use_request_body_not_params"
-                    ),
-                    backoff_type=self.config.get("backoff_type"),
-                    backoff_param=self.config.get("backoff_param"),
-                    backoff_time_extension=self.config.get("backoff_time_extension"),
-                    store_raw_json_message=self.config.get("store_raw_json_message"),
+                    start_date=s.get("start_date", self.config.get("start_date")),
+                    source_search_field=s.get("source_search_field", self.config.get("source_search_field")),
+                    source_search_query=s.get("source_search_query", self.config.get("source_search_query")),
+                    use_request_body_not_params=s.get("use_request_body_not_params", self.config.get("use_request_body_not_params", False)),
+                    backoff_type=s.get("backoff_type", self.config.get("backoff_type")),
+                    backoff_param=s.get("backoff_param", self.config.get("backoff_param", "Retry-After")),
+                    backoff_time_extension=s.get("backoff_time_extension", self.config.get("backoff_time_extension", 0)),
+                    store_raw_json_message=s.get("store_raw_json_message", self.config.get("store_raw_json_message", False)),
                     authenticator=self._authenticator,
-                    **twitter_config,  # Add Twitter-specific config
+                    # optional twitter routing
+                    twitter_stream_type=s.get("twitter_stream_type"),
+                    twitter_usernames=s.get("twitter_usernames", self.config.get("twitter_usernames", [])),
+                    twitter_hashtags=s.get("twitter_hashtags", self.config.get("twitter_hashtags", [])),
+                    twitter_parent_streams=s.get("twitter_parent_streams", []),
+                    twitter_max_per_run=s.get("twitter_max_per_run", 20),
+                    tap_instance=self,
                 )
             )
 
         return streams
 
-    def get_schema(
-        self,
-        records_path: str,
-        except_keys: list,
-        inference_records: int,
-        path: str,
-        params: dict,
-        headers: dict,
-    ) -> Any:
-        """Infer schema from the first records returned by api. Creates a Stream object.
-
-        If auth_method is set, will call get_authenticator to obtain credentials
-        to issue a request to sample some records. The get_authenticator will:
-        - stores the authenticator in self._authenticator
-        - sets the self.http_auth if required by a given authenticator
-        - use an existing authenticator if one exists and is cached.
-
-        Args:
-            records_path: required - see config_jsonschema.
-            except_keys: required - see config_jsonschema.
-            inference_records: required - see config_jsonschema.
-            path: required - see config_jsonschema.
-            params: required - see config_jsonschema.
-            headers: required - see config_jsonschema.
-
-        Raises:
-            ValueError: if the response is not valid or a record is not valid json.
-
-        Returns:
-            A schema for the stream.
-
-        """
-        # TODO: this request format is not very robust
-
-        # Initialise Variables
-        auth_method = self.config.get("auth_method", "")
-        self.http_auth = None
-
-        if auth_method and not auth_method == "no_auth":
-            # Obtaining Authenticator for authorisation to obtain a schema.
+    # --------------- Helpers ---------------
+    def _ensure_auth(self, headers: Dict[str, Any], params: Dict[str, Any]) -> None:
+        auth_method = self.config.get("auth_method", "no_auth")
+        if auth_method and auth_method != "no_auth":
+            # set or reuse authenticator
             get_authenticator(self)
-
-            # Get an initial oauth token if an oauth method
-            if auth_method == "oauth" and isinstance(
-                self._authenticator, ConfigurableOAuthAuthenticator
-            ):
+            if auth_method == "oauth" and isinstance(self._authenticator, ConfigurableOAuthAuthenticator):
                 self._authenticator.get_initial_oauth_token()
 
-            headers.update(getattr(self._authenticator, "auth_headers", {}))
-            params.update(getattr(self._authenticator, "auth_params", {}))
+            # merge any runtime auth headers/params (do not clobber explicit per-stream settings)
+            headers.update(getattr(self._authenticator, "auth_headers", {}) or {})
+            params.update(getattr(self._authenticator, "auth_params", {}) or {})
+
+    def _infer_schema(
+        self,
+        path: str,
+        headers: Dict[str, Any],
+        params: Dict[str, Any],
+        records_path: str,
+        except_keys: List[str],
+        max_records: int,
+    ) -> Dict[str, Any]:
+        if not path:
+            # no path => empty schema
+            return th.PropertiesList().to_dict()
+
+        # plug in auth if configured
+        self._ensure_auth(headers, params)
+
+        import requests
 
         r = requests.get(
             self.config["api_url"] + path,
-            auth=self.http_auth,
-            params=params,
             headers=headers,
+            params=params,
+            auth=self.http_auth,
+            timeout=60,
         )
-        if r.ok:
-            records = extract_jsonpath(records_path, input=r.json())
-        else:
-            self.logger.error(f"Error Connecting, message = {r.text}")
-            raise ValueError(r.text)
+        if not r.ok:
+            # expose server reason in logs AND raise (so discovery failure is explicit)
+            self.logger.error("Schema sample request failed %s %s: %s", r.status_code, path, r.text)
+            r.raise_for_status()
 
         builder = SchemaBuilder()
         builder.add_schema(th.PropertiesList().to_dict())
-        for i, record in enumerate(records):
-            if type(record) is not dict:
-                self.logger.error("Input must be a dict object.")
-                raise ValueError("Input must be a dict object.")
 
-            flat_record = flatten_json(
-                record, except_keys, store_raw_json_message=False
-            )
-
-            builder.add_object(flat_record)
-            # Optional add _sdc_raw_json field to store the raw message
+        cnt = 0
+        for rec in extract_jsonpath(records_path, input=r.json()):
+            if not isinstance(rec, dict):
+                continue
+            flat = flatten_json(rec, except_keys, store_raw_json_message=False)
+            builder.add_object(flat)
             if self.config.get("store_raw_json_message"):
                 builder.add_object({"_sdc_raw_json": {}})
-
-            if i >= inference_records:
+            cnt += 1
+            if cnt >= max_records:
                 break
 
-        self.logger.debug(f"{builder.to_json(indent=2)}")
         return builder.to_schema()
-    
+
+    # ---- Twitter state (optional) ----
     def add_collected_tweet_id(self, tweet_id: str) -> None:
-        """Add a tweet ID to the collected set (Twitter mode only)."""
-        if hasattr(self, '_twitter_collected_tweet_ids'):
-            self._twitter_collected_tweet_ids.add(tweet_id)
-    
+        self._tw_collected_tweet_ids.add(tweet_id)
+
     def get_collected_tweet_ids(self) -> Set[str]:
-        """Get collected tweet IDs (Twitter mode only)."""
-        return getattr(self, '_twitter_collected_tweet_ids', set())
-    
-    def add_pending_tweet_id(self, tweet_id: str, operation: str) -> None:
-        """Add a pending tweet ID for an operation (Twitter mode only)."""
-        if hasattr(self, '_twitter_pending_operations'):
-            if operation in self._twitter_pending_operations:
-                self._twitter_pending_operations[operation].add(tweet_id)
-    
-    def get_pending_tweet_ids(self, operation: str) -> Set[str]:
-        """Get pending tweet IDs for an operation (Twitter mode only)."""
-        if hasattr(self, '_twitter_pending_operations'):
-            return self._twitter_pending_operations.get(operation, set())
-        return set()
-    
-    def remove_pending_tweet_id(self, tweet_id: str, operation: str) -> None:
-        """Remove a processed tweet ID from pending (Twitter mode only)."""
-        if hasattr(self, '_twitter_pending_operations'):
-            if operation in self._twitter_pending_operations:
-                self._twitter_pending_operations[operation].discard(tweet_id)
-    
+        return set(self._tw_collected_tweet_ids)
+
+    def add_pending_tweet_id(self, tweet_id: str, op: str) -> None:
+        if op in self._tw_pending_ops:
+            self._tw_pending_ops[op].add(tweet_id)
+
+    def get_pending_tweet_ids(self, op: str) -> Set[str]:
+        return set(self._tw_pending_ops.get(op, set()))
+
+    def remove_pending_tweet_id(self, tweet_id: str, op: str) -> None:
+        if op in self._tw_pending_ops:
+            self._tw_pending_ops[op].discard(tweet_id)
