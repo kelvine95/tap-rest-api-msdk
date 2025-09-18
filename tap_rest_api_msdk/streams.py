@@ -70,47 +70,9 @@ class DynamicStream(RestApiStream):
         twitter_max_per_run: Optional[int] = None,
         tap_instance: Optional[Any] = None,
     ) -> None:
-        """Class initialization.
-
-        Args:
-            tap: see tap.py
-            name: see tap.py
-            path: see tap.py
-            params: see tap.py
-            headers: see tap.py
-            primary_keys: see tap.py
-            replication_key: see tap.py
-            except_keys: see tap.py
-            records_path: see tap.py
-            next_page_token_path: see tap.py
-            schema: the json schema for the stream.
-            pagination_request_style: see tap.py
-            pagination_response_style: see tap.py
-            pagination_page_size: see tap.py
-            pagination_results_limit: see tap.py
-            pagination_next_page_param: see tap.py
-            pagination_limit_per_page_param: see tap.py
-            pagination_total_limit_param: see tap.py
-            pagination_initial_offset: see tap.py
-            start_date: see tap.py
-            source_search_field: see tap.py
-            source_search_query: see tap.py
-            use_request_body_not_params: see tap.py
-            backoff_type: see tap.py
-            backoff_param: see tap.py
-            backoff_time_extension: see tap.py
-            store_raw_json_message: see tap.py
-            authenticator: see tap.py
-            twitter_mode: Enable Twitter-specific features
-            twitter_usernames: List of usernames for Twitter mode
-            twitter_hashtags: List of hashtags for Twitter mode
-            twitter_stream_type: Type of Twitter stream
-            twitter_parent_streams: Parent streams for dependent streams
-            twitter_max_per_run: Max records per run in Twitter mode
-            tap_instance: Reference to tap instance for state sharing
-
-        """
-        super().__init__(tap=tap, name=tap.name, schema=schema)
+        """Class initialization."""
+        # IMPORTANT: register the stream under its own name (not the tap's)
+        super().__init__(tap=tap, name=name, schema=schema)
 
         if primary_keys is None:
             primary_keys = []
@@ -125,9 +87,9 @@ class DynamicStream(RestApiStream):
         self.replication_key = replication_key
         self.except_keys = except_keys
         self.records_path = records_path
-        
+
         # Twitter-specific attributes
-        self.twitter_mode = twitter_mode
+        self.twitter_mode = bool(twitter_mode)
         self.twitter_usernames = twitter_usernames or []
         self.twitter_hashtags = twitter_hashtags or []
         self.twitter_stream_type = twitter_stream_type
@@ -139,13 +101,11 @@ class DynamicStream(RestApiStream):
 
         if next_page_token_path:
             self.next_page_token_jsonpath = next_page_token_path
-        elif (
-            pagination_request_style == "jsonpath_paginator"
-            or pagination_request_style == "default"
-        ):
-            self.next_page_token_jsonpath = (
-                "$.next_page"  # Set default for jsonpath_paginator
-            )
+        elif (pagination_request_style == "jsonpath_paginator" or
+            pagination_request_style == "default"):
+            # Set default for jsonpath_paginator
+            self.next_page_token_jsonpath = "$.next_page"
+
         get_url_params_styles = {
             "style1": self._get_url_params_offset_style,
             "offset": self._get_url_params_offset_style,
@@ -154,25 +114,21 @@ class DynamicStream(RestApiStream):
             "hateoas_body": self._get_url_params_hateoas_body,
         }
 
-        # Selecting the appropriate method to send Parameters as part of the
-        # request. If use_request_body_not_params is set the parameters are sent
-        # in the request body instead of request parameters. The
-        # pagination_response_style config determines what style of parameter
-        # processing is invoked.
-
+        # Parameter handling strategy
         self.use_request_body_not_params = use_request_body_not_params
         self.backoff_type = backoff_type
         self.backoff_param = backoff_param
         self.backoff_time_extension = backoff_time_extension
         self.store_raw_json_message = store_raw_json_message
+
         if self.use_request_body_not_params:
             self.prepare_request_payload = get_url_params_styles.get(  # type: ignore
                 pagination_response_style, self._get_url_params_page_style
-            )  # Defaults to page_style url_params
+            )
         else:
             self.get_url_params = get_url_params_styles.get(  # type: ignore
                 pagination_response_style, self._get_url_params_page_style
-            )  # Defaults to page_style url_params
+            )
 
         self.pagination_request_style = pagination_request_style
         self.pagination_results_limit = pagination_results_limit
@@ -191,44 +147,24 @@ class DynamicStream(RestApiStream):
             if pagination_page_size:
                 self.pagination_page_size = pagination_page_size
             else:
-                if self.pagination_limit_per_page_param:
-                    page_limit_param = self.pagination_limit_per_page_param
-                else:
-                    page_limit_param = "per_page"
-                self.pagination_page_size = int(
-                    self.params.get(page_limit_param, 25)
-                )  # Default to requesting 25 records
-        elif (
-            self.pagination_request_style == "style1"
-            or self.pagination_request_style == "offset_paginator"
-        ):
+                page_limit_param = self.pagination_limit_per_page_param or "per_page"
+                self.pagination_page_size = int(self.params.get(page_limit_param, 25))
+        elif self.pagination_request_style in ("style1", "offset_paginator"):
             if self.pagination_results_limit:
-                self.ABORT_AT_RECORD_COUNT = (
-                    self.pagination_results_limit
-                )  # Will raise an exception.
+                self.ABORT_AT_RECORD_COUNT = self.pagination_results_limit  # noqa: N806
             if pagination_page_size:
                 self.pagination_page_size = pagination_page_size
             else:
-                if self.pagination_limit_per_page_param:
-                    page_limit_param = self.pagination_limit_per_page_param
-                else:
-                    page_limit_param = "limit"
-                self.pagination_page_size = int(
-                    self.params.get(page_limit_param, 25)
-                )  # Default to requesting 25 records
+                page_limit_param = self.pagination_limit_per_page_param or "limit"
+                self.pagination_page_size = int(self.params.get(page_limit_param, 25))
         else:
             if self.pagination_results_limit:
-                self.ABORT_AT_RECORD_COUNT = (
-                    self.pagination_results_limit
-                )  # Will raise an exception.
+                self.ABORT_AT_RECORD_COUNT = self.pagination_results_limit  # noqa: N806
             self.pagination_page_size = pagination_page_size
 
-        # GitHub is missing the "since" parameter on a few endpoints
-        # set this parameter to True if your stream needs to navigate data in
-        # descending order
-        # and try to exit early on its own.
-        # This only has effect on streams whose `replication_key` is `updated_at`.
+        # For GitHub-like special-casing; disabled here by default.
         self.use_fake_since_parameter = False
+
 
     @property
     def http_headers(self) -> dict:
@@ -588,91 +524,109 @@ class DynamicStream(RestApiStream):
         return params
 
     def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        """Parse the response and return an iterator of result rows.
-
-        Args:
-            response: required - the requests.Response given by the api call.
-
-        Yields:
-              Parsed records.
-
-        """
-        # Twitter mode: Handle multiple iterations and collect tweet IDs
+        """Parse the response and return an iterator of result rows."""
+        # Twitter mode: specialized parsing
         if self.twitter_mode:
-            return self._parse_twitter_response(response)
-        
-        # Default behavior for non-Twitter APIs
-        yield from extract_jsonpath(self.records_path, input=response.json())
+            yield from self._parse_twitter_response(response)
+            return
+
+        # Default behavior for non-Twitter APIs with basic safety
+        try:
+            data = response.json()
+        except Exception:
+            self.logger.warning("Non-JSON or empty response; skipping page.")
+            return
+
+        yield from extract_jsonpath(self.records_path, input=data)
+
 
     def _parse_twitter_response(self, response: requests.Response) -> Iterable[dict]:
-        """Parse response in Twitter mode with special handling.
-        
-        Args:
-            response: API response
-            
-        Yields:
-            Parsed records with Twitter-specific processing
-        """
-        response_data = response.json()
-        
-        # Handle different Twitter response formats
+        """Parse response in Twitter mode with special handling."""
+        try:
+            response_data = response.json()
+        except Exception:
+            self.logger.warning("Twitter mode: response is not valid JSON; skipping.")
+            return
+
+        # --- user info ---------------------------------------------------------
         if self.twitter_stream_type == "user_info":
-            # Single user info record
-            if "data" in response_data:
-                yield response_data["data"]
-        elif self.twitter_stream_type in ["user_tweets", "mentions", "hashtag_tweets"]:
-            # These streams collect tweet IDs for dependent streams
-            records = response_data.get("tweets", [])
-            
+            data = response_data.get("data")
+            if isinstance(data, dict):
+                yield data
+            return
+
+        # --- collections with 'tweets' array -----------------------------------
+        if self.twitter_stream_type in {"user_tweets", "mentions", "hashtag_tweets"}:
+            records = response_data.get("tweets") or []
+            if not isinstance(records, list):
+                self.logger.debug("Twitter mode: expected list at key 'tweets'.")
+                return
+
             for record in records:
-                # Collect tweet ID if tap instance is available
+                if not isinstance(record, dict):
+                    continue
+
+                # collect tweet ID for dependent streams
                 if self.tap_instance and "id" in record:
-                    self.tap_instance.add_collected_tweet_id(record["id"])
-                
-                # Add tracking metadata
+                    try:
+                        self.tap_instance.add_collected_tweet_id(record["id"])
+                    except Exception:
+                        # never fail the stream because of state-sharing
+                        pass
+
+                # tracking metadata
                 if self.twitter_stream_type == "hashtag_tweets":
-                    # Add hashtag tracking info
-                    current_hashtag = getattr(self, '_current_hashtag', None)
+                    current_hashtag = getattr(self, "_current_hashtag", None)
                     if current_hashtag:
                         record["_hashtag_tracked"] = current_hashtag
-                elif self.twitter_stream_type in ["user_tweets", "mentions"]:
-                    # Add username tracking info
-                    current_username = getattr(self, '_current_username', None)
+                else:
+                    current_username = getattr(self, "_current_username", None)
                     if current_username:
                         record["_username_tracked"] = current_username
-                
+
                 record["_source_stream"] = self.twitter_stream_type
-                self._twitter_records_collected += 1
-                
-                # Check if we've hit the limit
+
+                # enforce limit
                 if self._twitter_records_collected >= self.twitter_max_per_run:
                     break
-                    
+                self._twitter_records_collected += 1
+
                 yield record
-                
-        elif self.twitter_stream_type in ["replies", "quotes"]:
-            # Dependent streams that use collected tweet IDs
+            return
+
+        # --- replies & quotes ---------------------------------------------------
+        if self.twitter_stream_type in {"replies", "quotes"}:
             if self.twitter_stream_type == "replies":
-                records = response_data.get("replies", [])
+                key = "replies"
             else:
-                records = response_data.get("tweets", [])  # quotes use tweets
-                
+                key = "tweets"  # quotes return under "tweets"
+
+            records = response_data.get(key) or []
+            if not isinstance(records, list):
+                self.logger.debug("Twitter mode: expected list at key '%s'.", key)
+                return
+
             for record in records:
-                # Add parent tweet ID metadata
-                current_tweet_id = getattr(self, '_current_tweet_id', None)
+                if not isinstance(record, dict):
+                    continue
+
+                # parent tweet metadata
+                current_tweet_id = getattr(self, "_current_tweet_id", None)
                 if current_tweet_id:
                     record["_parent_tweet_id"] = current_tweet_id
-                
+
                 record["_source_stream"] = self.twitter_stream_type
-                self._twitter_records_collected += 1
-                
+
+                # enforce limit
                 if self._twitter_records_collected >= self.twitter_max_per_run:
                     break
-                    
+                self._twitter_records_collected += 1
+
                 yield record
-        else:
-            # Fallback to default parsing
-            yield from extract_jsonpath(self.records_path, input=response_data)
+            return
+
+        # --- fallback -----------------------------------------------------------
+        yield from extract_jsonpath(self.records_path, input=response_data)
 
     def get_records(self, context: Optional[dict]) -> Iterable[Dict[str, Any]]:
         """Override to handle Twitter-specific iteration logic.
@@ -793,61 +747,66 @@ class DynamicStream(RestApiStream):
             yield from super().get_records(context)
 
     def _fetch_with_params(self, params: dict, context: Optional[dict]) -> Iterable[dict]:
-        """Fetch records with specific parameters.
-        
-        Args:
-            params: Request parameters
-            context: Stream context
-            
-        Yields:
-            Records from API
-        """
-        # Update params with base params
+        """Fetch records with specific parameters."""
+        # Merge base params with per-call overrides
         full_params = {**self.params, **params}
-        
-        # Make request
+
+        # Build and execute request
         prepared_request = self.prepare_request(context, full_params)
-        response = self.request_decorator(self._request)(prepared_request)
-        
+        # FIX: _request requires (prepared_request, context)
+        response = self.request_decorator(self._request)(prepared_request, context)
+
         if response.status_code == 200:
             yield from self.parse_response(response)
+        else:
+            self.logger.warning(
+                "API request failed (%s) for %s: %s",
+                response.status_code,
+                getattr(self, "name", "<unknown-stream>"),
+                getattr(response, "text", ""),
+            )
 
     def _fetch_with_pagination(self, params: dict, context: Optional[dict]) -> Iterable[dict]:
-        """Fetch records with pagination support.
-        
-        Args:
-            params: Request parameters
-            context: Stream context
-            
-        Yields:
-            Records from API with pagination
-        """
+        """Fetch records with pagination support."""
         cursor = ""
         has_more = True
-        
+
         while has_more and self._twitter_records_collected < self.twitter_max_per_run:
-            # Update params with cursor
+            # Merge base params and page cursor
             full_params = {**self.params, **params}
             if cursor:
                 full_params["cursor"] = cursor
-            
-            # Make request
+
+            # Build and execute request
             prepared_request = self.prepare_request(context, full_params)
-            response = self.request_decorator(self._request)(prepared_request)
-            
-            if response.status_code == 200:
+            # FIX: _request requires (prepared_request, context)
+            response = self.request_decorator(self._request)(prepared_request, context)
+
+            if response.status_code != 200:
+                self.logger.warning(
+                    "API request failed (%s) for %s: %s",
+                    response.status_code,
+                    getattr(self, "name", "<unknown-stream>"),
+                    getattr(response, "text", ""),
+                )
+                break  # stop the loop; avoid spinning on persistent failures
+
+            # Parse and emit records
+            try:
                 response_data = response.json()
-                
-                # Yield records
-                yield from self.parse_response(response)
-                
-                # Check for next page
-                if response_data.get("has_next_page") and response_data.get("next_cursor"):
-                    cursor = response_data["next_cursor"]
-                else:
-                    has_more = False
+            except Exception:
+                self.logger.warning("Non-JSON or empty response; stopping pagination.")
+                break
+
+            yield from self.parse_response(response)
+
+            # Paginate if possible
+            next_cursor = response_data.get("next_cursor")
+            has_next = response_data.get("has_next_page")
+
+            if has_next and next_cursor:
+                cursor = next_cursor
             else:
-                self.logger.warning(f"API request failed with status {response.status_code}")
                 has_more = False
 
     def post_process(  # noqa: PLR6301
