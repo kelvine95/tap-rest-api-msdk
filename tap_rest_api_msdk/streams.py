@@ -544,18 +544,19 @@ class DynamicStream(RestApiStream):
                 break
 
             # Check 2: Global tap limit
-            if self.tap.max_ingestion_limit and self.tap.total_records_processed >= self.tap.max_ingestion_limit:
-                if not self.tap.reached_max_limit: # Log message only once
-                    self.tap.logger.info(
-                        f"Tap has reached its global ingestion limit of {self.tap.max_ingestion_limit}."
+            # CORRECTED: Use self._tap instead of self.tap
+            if self._tap.max_ingestion_limit and self._tap.total_records_processed >= self._tap.max_ingestion_limit:
+                if not self._tap.reached_max_limit: # Log message only once
+                    self._tap.logger.info(
+                        f"Tap has reached its global ingestion limit of {self._tap.max_ingestion_limit}."
                     )
-                    self.tap.reached_max_limit = True
+                    self._tap.reached_max_limit = True
                 break
             
             yield record
             self._records_processed += 1
-            if hasattr(self.tap, 'total_records_processed'):
-                self.tap.total_records_processed += 1
+            if hasattr(self._tap, 'total_records_processed'):
+                self._tap.total_records_processed += 1
     # ----------------------------
     # Registry capture (Tweet IDs)
     # ----------------------------
