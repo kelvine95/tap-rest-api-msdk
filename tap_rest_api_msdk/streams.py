@@ -705,10 +705,10 @@ class DynamicStream(RestApiStream):
             self._tap.state["registry"] = reg  # explicit set for some runners
             self._tap.persist_state()
 
-    def post_process(  # noqa: PLR6301
+    def post_process(
         self,
-        row: types.Record,
-        context: Optional[types.Context] = None,  # noqa: ARG002
+        row: dict,
+        context: Optional[dict] = None,  # noqa: ARG002
     ) -> Optional[dict]:
         """As needed, append or transform raw data to match expected structure.
 
@@ -722,6 +722,7 @@ class DynamicStream(RestApiStream):
         Behavior:
         - Flattens the record via utils.flatten_json, honoring except_keys and
           store_raw_json_message settings.
+        - Converts specific date fields from Twitter's format to ISO 8601.
         - Injects constant metadata (if provided) without overwriting existing keys.
         - Optionally registers a tweet ID into Singer state for downstream fan-out
           (e.g., replies/quotes), controlled by id_registry_config.
@@ -731,6 +732,26 @@ class DynamicStream(RestApiStream):
 
         # Flatten first
         flat = flatten_json(row, self.except_keys, self.store_raw_json_message)
+        
+        # --- NEW: Convert date formats to ISO 8601 ---
+        # List of fields that use Twitter's non-standard date format
+        date_fields_to_convert = ["createdAt", "author_createdAt"]
+        for field_name in date_fields_to_convert:
+            if field_name in flat and isinstance(flat[field_name], str):
+                try:
+                    # Parse the input string: 'Mon Sep 15 00:12:16 +0000 2025'
+                    date_obj = datetime.strptime(
+                        flat[field_name], "%a %b %d %H:%M:%S %z %Y"
+                    )
+                    # Convert to ISO 8601 format, which the target expects
+                    flat[field_name] = date_obj.isoformat()
+                except ValueError:
+                    # If parsing fails for any reason, log a warning but don't crash
+                    self.logger.warning(
+                        f"Could not parse timestamp for field '{field_name}': "
+                        f"'{flat[field_name]}'"
+                    )
+        # --- END NEW ---
 
         # Inject constant metadata for provenance/partitioning (optional).
         if self.inject_metadata:
@@ -741,10 +762,9 @@ class DynamicStream(RestApiStream):
         # Only makes sense for tweet-like streams (advanced_search, last_tweets, hashtags),
         # but is safe to no-op elsewhere.
         try:
-            self._maybe_register_id(flat_record=flat, original_row=original_row)  # type: ignore[arg-type]
+            self._maybe_register_id(flat_record=flat, original_row=original_row)
         except Exception as ex:
             # Never fail the pipeline due to registry capture; just log.
             self.logger.debug(f"ID registry capture skipped due to error: {ex}")
 
         return flat
-    
