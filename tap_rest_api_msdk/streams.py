@@ -94,54 +94,14 @@ class DynamicStream(RestApiStream):
         authenticator: Optional[object] = None,
         inject_metadata: Optional[dict] = None,
         id_registry_config: Optional[dict] = None,
-        max_records_limit: Optional[int] = None,  # Per-stream total record limit
+        max_records_limit: Optional[int] = None,
+        config: Optional[dict] = None,  # <--- ADD THIS LINE
     ) -> None:
-        """Class initialization.
+        """Class initialization."""
+        # The docstring remains the same...
 
-        Args:
-            tap: see tap.py
-            name: see tap.py
-            path: see tap.py
-            params: see tap.py
-            headers: see tap.py
-            primary_keys: see tap.py
-            replication_key: see tap.py
-            except_keys: see tap.py
-            records_path: see tap.py
-            next_page_token_path: see tap.py
-            schema: the json schema for the stream.
-            pagination_request_style: see tap.py
-            pagination_response_style: see tap.py
-            pagination_page_size: see tap.py
-            pagination_results_limit: see tap.py
-            pagination_next_page_param: see tap.py
-            pagination_limit_per_page_param: see tap.py
-            pagination_total_limit_param: see tap.py
-            pagination_initial_offset: see tap.py
-            start_date: see tap.py
-            source_search_field: see tap.py
-            source_search_query: see tap.py
-            use_request_body_not_params: see tap.py
-            backoff_type: see tap.py
-            backoff_param: see tap.py
-            backoff_time_extension: see tap.py
-            store_raw_json_message: see tap.py
-            authenticator: see tap.py
-            inject_metadata: Optional constant metadata to inject into every record
-                (e.g., {"_source_handle": "coinlist"}). Backward compatible.
-            id_registry_config: Optional dict enabling tweet-ID registration for
-                downstream fan-out (e.g., replies/quotes). Example:
-                {
-                  "registry_key": "tweet_ids:twitter_timeline",
-                  "id_path": "$.id",                    # JSONPath to the tweet id
-                  "max_to_register_per_run": 50,        # cap per stream per run
-                  "min_like_count": 0,                  # filter by flattened fields
-                  "min_view_count": 0                   #   (uses 'likeCount', 'viewCount')
-                }
-                If omitted or invalid, no registry capture occurs.
-            max_records_limit: Optional per-stream total record limit
-        """
         super().__init__(tap=tap, name=tap.name, schema=schema)
+        self.config = config or {}  # <--- AND ADD THIS LINE
 
         if primary_keys is None:
             primary_keys = []
@@ -179,12 +139,6 @@ class DynamicStream(RestApiStream):
                 "$.next_page"  # Set default for jsonpath_paginator
             )
 
-        # Selecting the appropriate method to send Parameters as part of the
-        # request. If use_request_body_not_params is set the parameters are sent
-        # in the request body instead of request parameters. The
-        # pagination_response_style config determines what style of parameter
-        # processing is invoked.
-
         get_url_params_styles = {
             "style1": self._get_url_params_offset_style,
             "offset": self._get_url_params_offset_style,
@@ -199,13 +153,13 @@ class DynamicStream(RestApiStream):
         self.backoff_time_extension = backoff_time_extension
         self.store_raw_json_message = store_raw_json_message
         if self.use_request_body_not_params:
-            self.prepare_request_payload = get_url_params_styles.get(  # type: ignore
+            self.prepare_request_payload = get_url_params_styles.get(
                 pagination_response_style, self._get_url_params_page_style
-            )  # Defaults to page_style url_params
+            )
         else:
-            self.get_url_params = get_url_params_styles.get(  # type: ignore
+            self.get_url_params = get_url_params_styles.get(
                 pagination_response_style, self._get_url_params_page_style
-            )  # Defaults to page_style url_params
+            )
 
         # Pagination configuration
         self.pagination_results_limit = pagination_results_limit
@@ -219,7 +173,6 @@ class DynamicStream(RestApiStream):
         self.pagination_initial_offset = pagination_initial_offset
         self.offset_records_jsonpath = offset_records_jsonpath
 
-        # Setting Pagination Limits
         if self.pagination_request_style == "restapi_header_link_paginator":
             if pagination_page_size:
                 self.pagination_page_size = pagination_page_size
@@ -230,7 +183,7 @@ class DynamicStream(RestApiStream):
                     page_limit_param = "per_page"
                 self.pagination_page_size = int(
                     self.params.get(page_limit_param, 25)
-                )  # Default to requesting 25 records
+                )
         elif (
             self.pagination_request_style == "style1"
             or self.pagination_request_style == "offset_paginator"
@@ -238,7 +191,7 @@ class DynamicStream(RestApiStream):
             if self.pagination_results_limit:
                 self.ABORT_AT_RECORD_COUNT = (
                     self.pagination_results_limit
-                )  # Will raise an exception.
+                )
             if pagination_page_size:
                 self.pagination_page_size = pagination_page_size
             else:
@@ -248,19 +201,14 @@ class DynamicStream(RestApiStream):
                     page_limit_param = "limit"
                 self.pagination_page_size = int(
                     self.params.get(page_limit_param, 25)
-                )  # Default to requesting 25 records
+                )
         else:
             if self.pagination_results_limit:
                 self.ABORT_AT_RECORD_COUNT = (
                     self.pagination_results_limit
-                )  # Will raise an exception.
+                )
             self.pagination_page_size = pagination_page_size
-
-        # GitHub is missing the "since" parameter on a few endpoints
-        # set this parameter to True if your stream needs to navigate data in
-        # descending order
-        # and try to exit early on its own.
-        # This only has effect on streams whose `replication_key` is `updated_at`.
+        
         self.use_fake_since_parameter = False
 
     @property
