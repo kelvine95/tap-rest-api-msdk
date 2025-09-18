@@ -1,9 +1,7 @@
-"""REST authentication handling (generic)."""
-
-from __future__ import annotations
+"""REST authentication handling."""
 
 import os
-from typing import Any, Optional, Dict
+from typing import Any
 
 import boto3
 from requests_aws4auth import AWS4Auth
@@ -17,143 +15,306 @@ from singer_sdk.authenticators import (
 
 
 class AWSConnectClient:
-    """Light wrapper creating AWS4Auth from either explicit keys or profile."""
+    """A connection class to AWS Resources."""
 
-    def __init__(self, connection_config: Dict[str, Any], create_signed_credentials: bool = True) -> None:
-        self.connection_config = connection_config or {}
-        self.create_signed_credentials = bool(self.connection_config.get("create_signed_credentials", create_signed_credentials))
-        self.aws_auth: Optional[AWS4Auth] = None
-        self.region: Optional[str] = None
+    def __init__(self, connection_config, create_signed_credentials: bool = True):
+        self.connection_config = connection_config
+
+        # Initialise the variables
+        self.create_signed_credentials = create_signed_credentials
+        self.aws_auth = None
+        self.region = None
         self.credentials = None
-        self.aws_service: Optional[str] = None
-        self.session: Optional[boto3.session.Session] = None
+        self.aws_service = None
+        self.aws_session = None
 
-        self._create_session_and_store_auth()
+        # Establish a AWS Client
+        self.credentials = self._create_aws_client()
 
-    def _create_session_and_store_auth(self) -> None:
-        cfg = self.connection_config
-        profile = cfg.get("aws_profile") or os.environ.get("AWS_PROFILE")
-        access_key = cfg.get("aws_access_key_id") or os.environ.get("AWS_ACCESS_KEY_ID")
-        secret_key = cfg.get("aws_secret_access_key") or os.environ.get("AWS_SECRET_ACCESS_KEY")
-        session_token = cfg.get("aws_session_token") or os.environ.get("AWS_SESSION_TOKEN")
-        region = cfg.get("aws_region") or os.environ.get("AWS_REGION")
-        self.aws_service = cfg.get("aws_service") or os.environ.get("AWS_SERVICE")
+        # Store AWS Signed Credentials
+        self._store_aws4auth_credentials()
 
-        if access_key and secret_key:
-            self.session = boto3.session.Session(
-                aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key,
-                aws_session_token=session_token,
-                region_name=region,
+    def _create_aws_client(self, config=None):
+        if not config:
+            config = self.connection_config
+
+        # Get the required parameters from config file and/or environment variables
+        aws_profile = config.get("aws_profile") or os.environ.get("AWS_PROFILE")
+        aws_access_key_id = config.get("aws_access_key_id") or os.environ.get(
+            "AWS_ACCESS_KEY_ID"
+        )
+        aws_secret_access_key = config.get("aws_secret_access_key") or os.environ.get(
+            "AWS_SECRET_ACCESS_KEY"
+        )
+        aws_session_token = config.get("aws_session_token") or os.environ.get(
+            "AWS_SESSION_TOKEN"
+        )
+        aws_region = config.get("aws_region") or os.environ.get("AWS_REGION")
+        self.aws_service = config.get("aws_service", None) or os.environ.get(
+            "AWS_SERVICE"
+        )
+
+        if not config.get("create_signed_credentials", True):
+            self.create_signed_credentials = False
+
+        # AWS credentials based authentication
+        if aws_access_key_id and aws_secret_access_key:
+            self.aws_session = boto3.session.Session(
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key,
+                region_name=aws_region,
+                aws_session_token=aws_session_token,
             )
-        elif profile:
-            self.session = boto3.session.Session(profile_name=profile, region_name=region)
+        # AWS Profile based authentication
+        elif aws_profile:
+            self.aws_session = boto3.session.Session(profile_name=aws_profile)
         else:
-            # let default chain try
-            self.session = boto3.session.Session(region_name=region)
+            self.aws_session = None
 
-        self.region = self.session.region_name
-        self.credentials = self.session.get_credentials() if self.session else None
+        if self.aws_session:
+            self.region = self.aws_session.region_name
+            return self.aws_session.get_credentials()
+        else:
+            return None
 
-        if self.create_signed_credentials and self.credentials and self.aws_service and self.region:
-            # NB: requests-aws4auth uses 'session_token' (not aws_session)
+    def _store_aws4auth_credentials(self):
+        """Store the AWS Signed Credential for the available AWS credentials.
+
+        Returns:
+            The None.
+
+        """
+        if self.create_signed_credentials and self.credentials:
             self.aws_auth = AWS4Auth(
                 self.credentials.access_key,
                 self.credentials.secret_key,
                 self.region,
                 self.aws_service,
-                session_token=self.credentials.token,
+                aws_session=self.credentials.token,
             )
+        else:
+            self.aws_auth = None
 
-    def get_awsauth(self) -> Optional[AWS4Auth]:
+    def get_awsauth(self):
+        """Return the AWS Signed Connection for provided credentials.
+
+        Returns:
+            The awsauth object.
+
+        """
         return self.aws_auth
+
+    def get_aws_session_client(self):
+        """Return the AWS Signed Connection for provided credentials.
+
+        Returns:
+            The an AWS Session Client.
+
+        """
+        return self.aws_session.client(self.aws_service, region_name=self.region)
 
 
 class ConfigurableOAuthAuthenticator(OAuthAuthenticator):
-    """OAuth2 with flexible payload construction."""
+    """Configurable OAuth Authenticator."""
 
-    def get_initial_oauth_token(self) -> None:
+    def get_initial_oauth_token(self):
+        """Get oauth token for the tap schema discovery.
+
+        Requests an oauth token and sets the auth headers.
+        """
         if not self.is_token_valid():
             self.update_access_token()
+
         self.auth_headers["Authorization"] = f"Bearer {self.access_token}"
 
     @property
     def oauth_request_body(self) -> dict:
-        # accept both tap- and stream-level config
-        my_config = getattr(self, "config", None) or getattr(self, "_config", {}) or {}
-        required = my_config.get("grant_type")
-        if not required:
-            raise ValueError("Missing grant_type for OAuth token request.")
+        """Build up a list of OAuth2 parameters.
 
-        # optional fields
-        body = {"grant_type": required}
-        for k in (
-            "client_id", "client_secret", "username", "password",
-            "refresh_token", "scope", "redirect_uri"
-        ):
-            v = my_config.get(k)
-            if v:
-                body[k] = v
+        Build up a list of OAuth2 parameters to use depending
+        on what configuration items have been set and the type of OAuth
+        flow set by the grant_type.
+        """
+        # Test where the config is located in self
+        if self.config:  # Tap Config
+            my_config = self.config
+        elif self._config:  # Stream Config
+            my_config = self._config
 
-        extras = my_config.get("oauth_extras") or {}
-        body.update(extras)
-        return body
+        client_id = my_config.get("client_id")
+        client_secret = my_config.get("client_secret")
+        username = my_config.get("username")
+        password = my_config.get("password")
+        refresh_token = my_config.get("refresh_token")
+        grant_type = my_config.get("grant_type")
+        scope = my_config.get("scope")
+        redirect_uri = my_config.get("redirect_uri")
+        oauth_extras = my_config.get("oauth_extras")
 
+        oauth_params = {}
 
-def _resolve_config(self) -> dict:
-    return getattr(self, "config", None) or getattr(self, "_config", {}) or {}
+        # Test mandatory parameters based on grant_type
+        if grant_type:
+            oauth_params["grant_type"] = grant_type
+        else:
+            raise ValueError("Missing grant type for OAuth Token.")
+
+        if grant_type == "client_credentials":
+            if not (client_id and client_secret):
+                raise ValueError(
+                    "Missing either client_id or client_secret for "
+                    "'client_credentials' grant_type."
+                )
+
+        if grant_type == "password":
+            if not (username and password):
+                raise ValueError(
+                    "Missing either username or password for 'password' grant_type."
+                )
+
+        if grant_type == "refresh_token":
+            if not refresh_token:
+                raise ValueError(
+                    "Missing either refresh_token for 'refresh_token' grant_type."
+                )
+
+        # Add parameters if they are set
+        if scope:
+            oauth_params["scope"] = scope
+        if client_id:
+            oauth_params["client_id"] = client_id
+        if client_secret:
+            oauth_params["client_secret"] = client_secret
+        if username:
+            oauth_params["username"] = username
+        if password:
+            oauth_params["password"] = password
+        if refresh_token:
+            oauth_params["refresh_token"] = refresh_token
+        if redirect_uri:
+            oauth_params["redirect_uri"] = redirect_uri
+        if oauth_extras:
+            for k, v in oauth_extras.items():
+                oauth_params[k] = v
+
+        return oauth_params
 
 
 def select_authenticator(self) -> Any:
-    cfg = _resolve_config(self)
-    method = cfg.get("auth_method", "no_auth")
-    api_keys = cfg.get("api_keys") or {}
-    auth_headers = cfg.get("headers") or {}
+    """Call an appropriate SDK Authentication method.
 
-    if method == "api_key":
-        # Use the first key/value as header auth via SDK helper
-        if not api_keys:
-            raise ValueError("auth_method=api_key but no api_keys provided.")
-        (key, value), *_ = api_keys.items()
+    Calls an appropriate SDK Authentication method based on the the set auth_method.
+    If an auth_method is not provided, the tap will call the API using any settings from
+    the headers and params config.
+    Note: Each auth method requires certain configuration to be present see README.md
+    for each auth methods configuration requirements.
+
+    Raises:
+        ValueError: if the auth_method is unknown.
+
+    Returns:
+        A SDK Authenticator or None if no auth_method supplied.
+
+    """
+    # Test where the config is located in self
+    if self.config:  # Tap Config
+        my_config = self.config
+    elif self._config:  # Stream Config
+        my_config = self._config
+
+    auth_method = my_config.get("auth_method", "")
+    api_keys = my_config.get("api_keys", "")
+    self.http_auth = None
+
+    # Set http headers if headers are supplied
+    # Some OAUTH2 API's require headers to be supplied
+    # In the OAUTH request.
+    auth_headers = my_config.get("headers", None)
+
+    # Using API Key Authenticator, keys are extracted from api_keys dict
+    if auth_method == "api_key":
+        if api_keys:
+            for k, v in api_keys.items():
+                key = k
+                value = v
         return APIKeyAuthenticator(stream=self, key=key, value=value)
-
-    if method == "basic":
-        return BasicAuthenticator(stream=self, username=cfg.get("username", ""), password=cfg.get("password", ""))
-
-    if method == "oauth":
+    # Using Basic Authenticator
+    elif auth_method == "basic":
+        return BasicAuthenticator(
+            stream=self,
+            username=my_config.get("username", ""),
+            password=my_config.get("password", ""),
+        )
+    # Using OAuth Authenticator
+    elif auth_method == "oauth":
         return ConfigurableOAuthAuthenticator(
             stream=self,
-            auth_endpoint=cfg.get("access_token_url", ""),
-            oauth_scopes=cfg.get("scope", ""),
-            default_expiration=cfg.get("oauth_expiration_secs"),
-            oauth_headers=auth_headers or None,
+            auth_endpoint=my_config.get("access_token_url", ""),
+            oauth_scopes=my_config.get("scope", ""),
+            default_expiration=my_config.get("oauth_expiration_secs", ""),
+            oauth_headers=auth_headers,
+        )
+    # Using Bearer Token Authenticator
+    elif auth_method == "bearer_token":
+        return BearerTokenAuthenticator(
+            stream=self,
+            token=my_config.get("bearer_token", ""),
+        )
+    # Using AWS Authenticator
+    elif auth_method == "aws":
+        # Establish an AWS Connection Client and returned Signed Credentials
+        self.aws_connection = AWSConnectClient(
+            connection_config=my_config.get("aws_credentials", None)
         )
 
-    if method == "bearer_token":
-        return BearerTokenAuthenticator(stream=self, token=cfg.get("bearer_token", ""))
+        if self.aws_connection.aws_auth:
+            self.http_auth = self.aws_connection.aws_auth
+        else:
+            self.http_auth = None
 
-    if method == "aws":
-        client = AWSConnectClient(cfg.get("aws_credentials") or {})
-        self.http_auth = client.get_awsauth()
         return self.http_auth
-
-    if method == "no_auth":
-        return APIAuthenticatorBase(stream=self)
-
-    raise ValueError(
-        f"Unknown auth_method '{method}'. Use one of: no_auth, api_key, basic, oauth, bearer_token, aws."
-    )
+    elif auth_method != "no_auth":
+        self.logger.error(
+            f"Unknown authentication method {auth_method}. Use api_key, basic, oauth, "
+            f"bearer_token, or aws."
+        )
+        raise ValueError(
+            f"Unknown authentication method {auth_method}. Use api_key, basic, oauth, "
+            f"bearer_token, or aws."
+        )
 
 
 def get_authenticator(self) -> Any:
-    cfg = _resolve_config(self)
-    method = cfg.get("auth_method", "no_auth")
-    if not getattr(self, "_authenticator", None):
+    """Retrieve the appropriate authenticator in tap and stream.
+
+    If the authenticator already exists, use the cached
+    Authenticator
+
+    Note: Store the authenticator in class variables used by the SDK.
+
+    Returns:
+        None
+
+    """
+    # Test where the config is located in self
+    if self.config:  # Tap Config
+        my_config = self.config
+    elif self._config:  # Stream Config
+        my_config = self._config
+
+    auth_method = my_config.get("auth_method", None)
+    self.http_auth = None
+
+    if not self._authenticator:
         self._authenticator = select_authenticator(self)
-    elif method == "oauth" and hasattr(self._authenticator, "is_token_valid") and not self._authenticator.is_token_valid():
-        # refresh token
-        self._authenticator = select_authenticator(self)
-    if method == "aws":
-        # http_auth is used directly on requests (not SDK headers)
+        if not self._authenticator:
+            # No Auth Method, use default Authenticator
+            self._authenticator = APIAuthenticatorBase(stream=self)
+    if auth_method == "oauth":
+        if not self._authenticator.is_token_valid():
+            # Obtain a new OAuth token as it has expired
+            self._authenticator = select_authenticator(self)
+    if auth_method == "aws":
+        # Set the http_auth which is used in the Request call for AWS
         self.http_auth = self._authenticator
-    return self._authenticator
+        
