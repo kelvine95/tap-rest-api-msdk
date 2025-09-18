@@ -383,15 +383,9 @@ class DynamicStream(RestApiStream):
     def _get_url_params_page_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """Return a dictionary of values to be used in URL parameterization.
-
-        Args:
-            context: optional - the singer context object.
-            next_page_token: optional - the token for the next page of results.
-
-        Returns:
-            An object containing the parameters to add to the request.
-
+        """
+        Return a dictionary of values to be used in URL parameterization.
+        This version is corrected to handle cursor-based pagination.
         """
         # Initialise Starting Values
         last_run_date = get_start_date(self, context)
@@ -399,17 +393,15 @@ class DynamicStream(RestApiStream):
         if self.params:
             for k, v in self.params.items():
                 params[k] = v
+
+        # If a next_page_token (the cursor value) exists, add it to the params.
+        # It uses the `pagination_next_page_param` setting from meltano.yml,
+        # which we will set to 'cursor'.
         if next_page_token:
-            if self.pagination_next_page_param:
-                next_page_parm = self.pagination_next_page_param
-            else:
-                next_page_parm = "page"
-            params[next_page_parm] = next_page_token
+            next_page_param = self.pagination_next_page_param or "page"
+            params[next_page_param] = next_page_token
+
         if self.replication_key:
-            # Use incremental replication (if available) via a filter query being
-            # sent to the API This assumes storing a replication timestamp and querying
-            # records greater than that date in subsequent runs. Config the appropriate
-            # source field and query template.
             if self.source_search_field and self.source_search_query and last_run_date:
                 query_template = Template(self.source_search_query)
                 if self.use_request_body_not_params:
