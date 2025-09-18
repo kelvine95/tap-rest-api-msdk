@@ -496,6 +496,10 @@ class TapRestApiMsdk(Tap):
         
         # Check if Twitter mode is enabled
         twitter_mode = self.config.get("twitter_mode", False)
+
+        auth_method = self.config.get("auth_method", "")
+        if auth_method and auth_method != "no_auth" and self._authenticator is None:
+            get_authenticator(self)
         
         for stream in self.config["streams"]:
             # resolve config

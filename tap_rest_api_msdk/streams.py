@@ -17,6 +17,8 @@ from singer_sdk.pagination import (
     SimpleHeaderPaginator,
     SinglePagePaginator,
 )
+from singer_sdk.exceptions import FatalAPIError
+from requests.exceptions import RequestException
 from tap_rest_api_msdk.client import RestApiStream
 from tap_rest_api_msdk.pagination import (
     RestAPIBasePageNumberPaginator,
@@ -168,23 +170,21 @@ class DynamicStream(RestApiStream):
 
     @property
     def http_headers(self) -> dict:
-        """Return the http headers needed.
-
-        Returns:
-              A dictionary of the headers to be included in the request.
-
-        """
         headers = {}
+
         if "user_agent" in self.config:
             headers["User-Agent"] = self.config.get("user_agent")
-        # If not using an authenticator, you may also provide inline auth headers:
-        # headers["Private-Token"] = self.config.get("auth_token")
 
         if self.headers:
-            for k, v in self.headers.items():
-                headers[k] = v
+            headers.update(self.headers)
+
+        # Ensure api_keys (e.g., {"X-API-Key": "..."} ) are actually sent
+        api_keys = self.config.get("api_keys")
+        if isinstance(api_keys, dict):
+            headers.update(api_keys)
 
         return headers
+
 
     def backoff_wait_generator(
         self,
@@ -704,11 +704,10 @@ class DynamicStream(RestApiStream):
                 except Exception:
                     last_sync = None
                 if last_sync:
-                    # Ensure UTC and full timestamp with _UTC suffix per API examples
                     last_sync_utc = last_sync.astimezone(timezone.utc)
                     q += f" since:{last_sync_utc.strftime('%Y-%m-%d_%H:%M:%S')}_UTC"
 
-                local = {"query": q, "queryType": "Latest"}
+                local = {"query": q, "queryType": "Latest"}  # GET + query params
                 yield from self._fetch_with_pagination(local, context)
             return
 
@@ -785,31 +784,45 @@ class DynamicStream(RestApiStream):
             )
 
     def _fetch_with_pagination(self, params: dict, context: Optional[dict]) -> Iterable[dict]:
-        """Fetch records with pagination support."""
         cursor = ""
         has_more = True
 
         while has_more and self._twitter_records_collected < self.twitter_max_per_run:
-            # Merge base params and page cursor
-            full_params = {**self.params, **params}
+            full_params = {**(self.params or {}), **(params or {})}
             if cursor:
                 full_params["cursor"] = cursor
 
-            # Build and execute request
-            prepared_request = self.prepare_request(context, full_params)
-            # FIX: _request requires (prepared_request, context)
-            response = self.request_decorator(self._request)(prepared_request, context)
-
-            if response.status_code != 200:
-                self.logger.warning(
-                    "API request failed (%s) for %s: %s",
-                    response.status_code,
-                    getattr(self, "name", "<unknown-stream>"),
-                    getattr(response, "text", ""),
+            # Useful debug for advanced_search
+            if self.twitter_stream_type == "hashtag_tweets":
+                self.logger.info(
+                    "advanced_search GET %s params=%s",
+                    getattr(self, "path", ""),
+                    {k: v for k, v in full_params.items()},
                 )
-                break  # stop the loop; avoid spinning on persistent failures
 
-            # Parse and emit records
+            prepared_request = self.prepare_request(context, full_params)
+
+            try:
+                response = self.request_decorator(self._request)(prepared_request, context)
+            except FatalAPIError as e:
+                resp = getattr(e, "response", None)
+                status = getattr(resp, "status_code", "n/a")
+                text = getattr(resp, "text", "")
+                self.logger.error(
+                    "Request failed (%s) stream=%s type=%s body=%s",
+                    status,
+                    getattr(self, "name", "<unknown-stream>"),
+                    getattr(self, "twitter_stream_type", "<non-twitter>"),
+                    text,
+                )
+                break
+            except RequestException as e:
+                self.logger.error("Network/HTTP error: %s", e)
+                break
+            except Exception as e:
+                self.logger.error("Unexpected error during request: %s", e)
+                break
+
             try:
                 response_data = response.json()
             except Exception:
@@ -818,7 +831,6 @@ class DynamicStream(RestApiStream):
 
             yield from self.parse_response(response)
 
-            # Paginate if possible
             next_cursor = response_data.get("next_cursor")
             has_next = response_data.get("has_next_page")
 
