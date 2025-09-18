@@ -59,6 +59,12 @@ class TapRestApiMsdk(Tap):
     # end-point for each stream.
     _authenticator: Optional[APIAuthenticatorBase] = None
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.total_records_processed = 0
+        self.max_ingestion_limit = self.config.get("max_ingestion_limit")
+        self.reached_max_limit = False
+
     # ----------------------
     # Common (stream) schema
     # ----------------------
@@ -659,110 +665,48 @@ class TapRestApiMsdk(Tap):
     # Discovery and helpers
     # ----------------------
     def discover_streams(self) -> List[DynamicStream]:  # type: ignore
-        """Return a list of discovered streams.
-
-        Enhancements:
-        - Honors per-stream `next_page_token_path`, `pagination_*` overrides.
-        - Expands `iteration_config` into multiple concrete streams, injecting
-          optional provenance metadata (e.g., `_source_handle`).
-        - Applies minimal `replication_request_adapter`:
-            * mode=add_query_suffix → append " since:<ISO_UTC>" to a param
-            * mode=param (+ transform=epoch_seconds) → set a param value
-        - Supports registry-driven iteration (if `iteration_config.from_registry`
-          is provided) reading from `state["registry"][key]`.
-        - Passes `id_registry_config` into streams for ID capture (e.g., tweet IDs).
-        """
+        """Return a list of discovered streams."""
         streams: List[DynamicStream] = []
-
-        def _resolve_dt(maybe_str: Any) -> Optional[datetime]:
-            """Parse an ISO string with optional 'Z' into a timezone-aware datetime."""
-            if not maybe_str:
-                return None
-            if isinstance(maybe_str, datetime):
-                return maybe_str
-            if isinstance(maybe_str, str):
-                try:
-                    return datetime.fromisoformat(maybe_str.replace("Z", "+00:00"))
-                except Exception:
-                    return None
-            return None
-
-        def _apply_replication_request_adapter(stream_cfg: dict, params: dict) -> None:
-            """Mutate params according to a minimal replication adapter.
-
-            Supported patterns for Twitter-style APIs:
-              - mode=add_query_suffix + key=<param> + template=" since:${iso_utc}"
-              - mode=param + key=<param> + transform=epoch_seconds
-            """
-            rra = stream_cfg.get("replication_request_adapter")
-            if not rra:
-                return
-            mode = rra.get("mode")
-            key = rra.get("key")
-            if not key:
-                return
-
-            since_dt = _resolve_dt(stream_cfg.get("start_date", self.config.get("start_date")))
-            if not since_dt:
-                return
-
-            if mode == "add_query_suffix":
-                template = rra.get("template", "")
-                suffix = template.replace("${iso_utc}", _iso_utc(since_dt))
-                if key in params and isinstance(params[key], str):
-                    params[key] = params[key] + suffix
-            elif mode == "param":
-                transform = rra.get("transform")
-                if transform == "epoch_seconds":
-                    params[key] = _epoch_seconds(since_dt)
 
         def _make_stream(stream_cfg: dict, inject_meta: Optional[dict] = None) -> DynamicStream:
             """Create a DynamicStream with fully-resolved per-stream settings."""
-            # Resolve config overlays
+            # Resolve config overlays from the top-level config
             records_path = stream_cfg.get("records_path", self.config.get("records_path", "$[*]"))
             except_keys = stream_cfg.get("except_keys", self.config.get("except_keys", []))
             path = stream_cfg.get("path", self.config.get("path", ""))
             params = {**self.config.get("params", {}), **stream_cfg.get("params", {})}
             headers = {**self.config.get("headers", {}), **stream_cfg.get("headers", {})}
-            start_date = stream_cfg.get("start_date", self.config.get("start_date", ""))
-            replication_key = stream_cfg.get("replication_key", self.config.get("replication_key", ""))
-            source_search_field = stream_cfg.get("source_search_field", self.config.get("source_search_field", ""))
-            source_search_query = stream_cfg.get("source_search_query", self.config.get("source_search_query", ""))
-            offset_records_jsonpath = stream_cfg.get("offset_records_jsonpath", self.config.get("offset_records_jsonpath", None))
+            replication_key = stream_cfg.get("replication_key", self.config.get("replication_key"))
 
-            # Apply the minimal replication adapter (adds since suffix or param).
-            _apply_replication_request_adapter(stream_cfg, params)
-
-            # Schema resolution (unchanged default behavior)
+            # Schema resolution: Use schema from config if present, otherwise infer it.
             schema: Dict[str, Any] = {}
             schema_config = stream_cfg.get("schema")
             if isinstance(schema_config, str):
-                self.logger.info("Found path to a schema, not doing discovery.")
+                self.logger.info(f"Stream '{stream_cfg['name']}': Found path to a schema, not doing discovery.")
                 with open(schema_config, "r") as f:
                     schema = json.load(f)
             elif isinstance(schema_config, dict):
-                self.logger.info("Found schema in config, not doing discovery.")
+                self.logger.info(f"Stream '{stream_cfg['name']}': Found schema in config, not doing discovery.")
                 builder = SchemaBuilder()
                 builder.add_schema(schema_config)
                 schema = builder.to_schema()
             else:
-                self.logger.info("No schema found. Inferring schema from API call.")
+                self.logger.info(f"Stream '{stream_cfg['name']}': No schema found. Inferring schema from API call.")
                 schema = self.get_schema(
                     records_path,
                     except_keys,
-                    stream_cfg.get("num_inference_records", self.config["num_inference_records"]),
+                    stream_cfg.get("num_inference_records", self.config.get("num_inference_records", 50)),
                     path,
                     params,
                     headers,
                 )
-
+            
             # Per-stream pagination overrides (fallback to top-level if absent).
             next_page_token_path = stream_cfg.get("next_page_token_path", self.config.get("next_page_token_path"))
             pagination_next_page_param = stream_cfg.get("pagination_next_page_param", self.config.get("pagination_next_page_param"))
-            pagination_limit_per_page_param = stream_cfg.get("pagination_limit_per_page_param", self.config.get("pagination_limit_per_page_param"))
-            pagination_page_size = stream_cfg.get("pagination_page_size", self.config.get("pagination_page_size"))
-            pagination_results_limit = stream_cfg.get("pagination_results_limit", self.config.get("pagination_results_limit"))
 
+            # Note: We now pass the entire stream_cfg to the DynamicStream.
+            # This allows the stream to access its own 'replication_request_adapter' config.
             return DynamicStream(
                 tap=self,
                 name=stream_cfg["name"],
@@ -773,32 +717,24 @@ class TapRestApiMsdk(Tap):
                 primary_keys=stream_cfg.get("primary_keys", self.config.get("primary_keys", [])),
                 replication_key=replication_key,
                 except_keys=except_keys,
-                next_page_token_path=next_page_token_path,  # critical for cursor pagination
-                pagination_request_style=self.config["pagination_request_style"],
-                pagination_response_style=self.config["pagination_response_style"],
-                pagination_page_size=pagination_page_size,
-                pagination_results_limit=pagination_results_limit,
-                pagination_next_page_param=pagination_next_page_param,           # 'cursor' for twitterapi.io
-                pagination_limit_per_page_param=pagination_limit_per_page_param,
-                pagination_total_limit_param=self.config.get("pagination_total_limit_param"),
-                pagination_initial_offset=self.config.get("pagination_initial_offset", 1),
-                offset_records_jsonpath=offset_records_jsonpath,
                 schema=schema,
-                start_date=start_date,
-                source_search_field=source_search_field,
-                source_search_query=source_search_query,
-                use_request_body_not_params=self.config.get("use_request_body_not_params"),
-                backoff_type=self.config.get("backoff_type"),
-                backoff_param=self.config.get("backoff_param"),
-                backoff_time_extension=self.config.get("backoff_time_extension"),
-                store_raw_json_message=self.config.get("store_raw_json_message"),
+                next_page_token_path=next_page_token_path,
+                pagination_request_style=self.config.get("pagination_request_style", "default"),
+                pagination_response_style=self.config.get("pagination_response_style", "default"),
+                pagination_next_page_param=pagination_next_page_param,
+                max_records_limit=stream_cfg.get("max_records_limit"),
+                id_registry_config=stream_cfg.get("id_registry_config"),
+                inject_metadata=inject_meta or {},
                 authenticator=self._authenticator,
-                inject_metadata=inject_meta or {},  # tag each record with provenance
-                id_registry_config=stream_cfg.get("id_registry_config", None),  # enable ID capture on producing streams
+                config=stream_cfg  # Pass stream-specific config
             )
 
-        # ---- Main expansion loop: iteration_config → concrete streams ----
-        for base_stream in self.config["streams"]:
+        # Main expansion loop: Process each stream definition from meltano.yml
+        for base_stream in self.config.get("streams", []):
+            if self.reached_max_limit:
+                self.logger.info("Global record limit reached, skipping remaining streams.")
+                break
+
             iter_cfg = base_stream.get("iteration_config")
             if not iter_cfg:
                 # No iteration: build a single stream as-is.
@@ -806,41 +742,30 @@ class TapRestApiMsdk(Tap):
                 continue
 
             values: List[Any] = []
-            inject_key = iter_cfg.get("metadata_key")   # e.g., "_source_handle"
+            inject_key = iter_cfg.get("metadata_key")
             api_param_key = iter_cfg.get("api_param_key")
             api_param_template = iter_cfg.get("api_param_template", "{value}")
 
-            # Option A: Use explicit values from YAML (usernames/hashtags/keywords)
             if "values" in iter_cfg and iter_cfg["values"]:
                 values = list(iter_cfg["values"])
-
-            # Option B: Pull values from registry in Singer state (optional, fan-out)
-            # Example: iteration_config:
-            #   from_registry: "tweet_ids:twitter_timeline"
-            #   max_values: 5
-            if not values and "from_registry" in iter_cfg:
+            elif "from_registry" in iter_cfg:
                 reg_key = str(iter_cfg["from_registry"])
                 max_values = int(iter_cfg.get("max_values", 0)) or None
                 reg = self.state.get("registry", {})
                 seq = reg.get(reg_key, []) if isinstance(reg, dict) else []
-                # Ensure only simple JSON-serializable items (strings/ints)
                 cleaned = [x for x in seq if isinstance(x, (str, int))]
                 values = cleaned[:max_values] if max_values else cleaned
 
-            # If still no values or missing api_param_key, fall back to single stream.
             if not values or not api_param_key:
                 streams.append(_make_stream(base_stream))
                 continue
 
-            # Materialize concrete streams for each value.
             for val in values:
                 s = copy.deepcopy(base_stream)
-                # Distinct name per partition, without special chars that annoy targets.
-                safe_val = str(val).replace("#", "hash_").replace(" ", "_")
+                safe_val = str(val).replace("#", "hash_").replace(" ", "_").replace(":", "_")
                 s["name"] = f"{base_stream['name']}__{safe_val}"
                 s.setdefault("params", {})
                 s["params"][api_param_key] = api_param_template.replace("{value}", str(val))
-
                 inject_meta = {inject_key: val} if inject_key else {}
                 streams.append(_make_stream(s, inject_meta=inject_meta))
 

@@ -2,7 +2,7 @@
 
 import email.utils
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from string import Template
 from typing import Any, Dict, Generator, Iterable, Optional, Union
 from urllib.parse import parse_qs, parse_qsl, urlparse
@@ -36,6 +36,18 @@ from tap_rest_api_msdk.utils import flatten_json, get_start_date
 # requests_log.setLevel(logging.DEBUG)
 # requests_log.propagate = True
 
+
+def _iso_utc(dt_obj: datetime) -> str:
+        """Format datetime as strict ISO-8601 in UTC with 'Z' suffix."""
+        if dt_obj.tzinfo is None:
+            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+        return dt_obj.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _epoch_seconds(dt_obj: datetime) -> int:
+    """Convert a datetime (naive treated as UTC) to epoch seconds."""
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+    return int(dt_obj.timestamp())
 
 class DynamicStream(RestApiStream):
     """Define custom stream.
@@ -383,38 +395,38 @@ class DynamicStream(RestApiStream):
     def _get_url_params_page_style(
         self, context: Optional[dict], next_page_token: Optional[Any]
     ) -> Dict[str, Any]:
-        """
-        Return a dictionary of values to be used in URL parameterization.
-        This version is corrected to handle cursor-based pagination.
-        """
-        # Initialise Starting Values
-        last_run_date = get_start_date(self, context)
-        params: dict = {}
-        if self.params:
-            for k, v in self.params.items():
-                params[k] = v
+        """Return a dictionary of values to be used in URL parameterization."""
+        params: dict = self.params.copy() if self.params else {}
 
-        # If a next_page_token (the cursor value) exists, add it to the params.
-        # It uses the `pagination_next_page_param` setting from meltano.yml,
-        # which we will set to 'cursor'.
         if next_page_token:
             next_page_param = self.pagination_next_page_param or "page"
             params[next_page_param] = next_page_token
 
-        if self.replication_key:
-            if self.source_search_field and self.source_search_query and last_run_date:
-                query_template = Template(self.source_search_query)
-                if self.use_request_body_not_params:
-                    params[self.source_search_field] = json.loads(
-                        query_template.substitute(last_run_date=last_run_date)
-                    )
-                else:
-                    params[self.source_search_field] = query_template.substitute(
-                        last_run_date=last_run_date
-                    )
-            else:
-                params["sort"] = "asc"
-                params["order_by"] = self.replication_key
+        # `get_starting_timestamp` correctly gets the bookmark from the state file
+        # or falls back to the `start_date` on the first run.
+        start_date = self.get_starting_timestamp(context)
+        
+        # This tap has a custom `replication_request_adapter` config. We apply it here.
+        rra_config = self.config.get("replication_request_adapter")
+        if self.replication_key and start_date and rra_config:
+            mode = rra_config.get("mode")
+            key = rra_config.get("key")
+            
+            if mode == "add_query_suffix":
+                template = rra_config.get("template", "")
+                # Use the correct variable from the template
+                if "${start_date_iso}" in template:
+                    iso_date = start_date.strftime("%Y-%m-%dT%H:%M:%S")
+                    suffix = template.replace("${start_date_iso}", iso_date)
+                    if key in params and isinstance(params[key], str):
+                        params[key] += suffix
+                    else:
+                        params[key] = suffix
+            
+            elif mode == "param":
+                transform = rra_config.get("transform")
+                if transform == "epoch_seconds":
+                    params[key] = _epoch_seconds(start_date)
 
         return params
 
@@ -600,31 +612,26 @@ class DynamicStream(RestApiStream):
         return params
 
     def parse_response(self, response: requests.Response) -> Iterable[dict]:
-        """Parse the response and return an iterator of result rows.
-
-        Args:
-            response: required - the requests.Response given by the api call.
-
-        Yields:
-              Parsed records.
-
-        """
-        # Check if we've hit the per-stream record limit
-        if self.max_records_limit and self._records_processed >= self.max_records_limit:
-            self.logger.info(
-                f"Stream {self.name} reached max_records_limit of {self.max_records_limit}"
-            )
-            return
-            
+        """Parse the response and return an iterator of result rows."""
         for record in extract_jsonpath(self.records_path, input=response.json()):
+            # Check 1: Per-stream limit
             if self.max_records_limit and self._records_processed >= self.max_records_limit:
                 self.logger.info(
-                    f"Stream {self.name} stopping at {self.max_records_limit} records"
+                    f"Stream '{self.name}' reached its record limit of {self.max_records_limit}."
                 )
-                return
-            self._records_processed += 1
-            yield record
+                break  # Stop processing records from this page and stream
 
+            # Check 2: Global tap limit
+            if self.tap.max_ingestion_limit and self.tap.total_records_processed >= self.tap.max_ingestion_limit:
+                self.tap.logger.info(
+                    f"Tap has reached its global ingestion limit of {self.tap.max_ingestion_limit}."
+                )
+                self.tap.reached_max_limit = True
+                break 
+            
+            yield record
+            self._records_processed += 1
+            self.tap.total_records_processed += 1
     # ----------------------------
     # Registry capture (Tweet IDs)
     # ----------------------------
