@@ -1,5 +1,3 @@
-# tap_rest_api_msdk/streams.py
-
 """Stream type classes for tap-rest-api-msdk."""
 
 import email.utils
@@ -48,6 +46,7 @@ class DynamicStream(RestApiStream):
     - `id_registry_config`: optionally register tweet IDs into Singer state so that
       downstream streams (e.g., replies/quotes) can iterate tweet IDs without
       hardcoding them in YAML. See `id_registry_config` docstring below.
+    - `max_records_limit`: Per-stream limit for total records to fetch
     """
 
     def __init__(
@@ -83,6 +82,7 @@ class DynamicStream(RestApiStream):
         authenticator: Optional[object] = None,
         inject_metadata: Optional[dict] = None,
         id_registry_config: Optional[dict] = None,
+        max_records_limit: Optional[int] = None,  # Per-stream total record limit
     ) -> None:
         """Class initialization.
 
@@ -127,6 +127,7 @@ class DynamicStream(RestApiStream):
                   "min_view_count": 0                   #   (uses 'likeCount', 'viewCount')
                 }
                 If omitted or invalid, no registry capture occurs.
+            max_records_limit: Optional per-stream total record limit
         """
         super().__init__(tap=tap, name=tap.name, schema=schema)
 
@@ -148,7 +149,13 @@ class DynamicStream(RestApiStream):
         self.inject_metadata = inject_metadata or {}
         self.id_registry_config = id_registry_config or {}
         self._id_registry_cache: set[str] = set()  # dedupe within this run
+        self.max_records_limit = max_records_limit  # Per-stream record limit
+        self._records_processed = 0  # Track records processed in this stream
 
+        # Store pagination styles FIRST, before any conditional logic
+        self.pagination_request_style = pagination_request_style
+        self.pagination_response_style = pagination_response_style
+        
         # Respect stream-level next_page_token_path when provided.
         if next_page_token_path:
             self.next_page_token_jsonpath = next_page_token_path
@@ -189,7 +196,6 @@ class DynamicStream(RestApiStream):
             )  # Defaults to page_style url_params
 
         # Pagination configuration
-        self.pagination_request_style = pagination_request_style
         self.pagination_results_limit = pagination_results_limit
         self.pagination_next_page_param = pagination_next_page_param
         self.pagination_limit_per_page_param = pagination_limit_per_page_param
@@ -611,7 +617,21 @@ class DynamicStream(RestApiStream):
               Parsed records.
 
         """
-        yield from extract_jsonpath(self.records_path, input=response.json())
+        # Check if we've hit the per-stream record limit
+        if self.max_records_limit and self._records_processed >= self.max_records_limit:
+            self.logger.info(
+                f"Stream {self.name} reached max_records_limit of {self.max_records_limit}"
+            )
+            return
+            
+        for record in extract_jsonpath(self.records_path, input=response.json()):
+            if self.max_records_limit and self._records_processed >= self.max_records_limit:
+                self.logger.info(
+                    f"Stream {self.name} stopping at {self.max_records_limit} records"
+                )
+                return
+            self._records_processed += 1
+            yield record
 
     # ----------------------------
     # Registry capture (Tweet IDs)
@@ -735,3 +755,4 @@ class DynamicStream(RestApiStream):
             self.logger.debug(f"ID registry capture skipped due to error: {ex}")
 
         return flat
+    
