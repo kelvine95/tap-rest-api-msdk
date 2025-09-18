@@ -94,14 +94,13 @@ class DynamicStream(RestApiStream):
         authenticator: Optional[object] = None,
         inject_metadata: Optional[dict] = None,
         id_registry_config: Optional[dict] = None,
-        max_records_limit: Optional[int] = None,
-        config: Optional[dict] = None,  # <--- ADD THIS LINE
+        max_records_limit: Optional[int] = None,  # Per-stream total record limit
+        config: Optional[dict] = None,
     ) -> None:
         """Class initialization."""
-        # The docstring remains the same...
-
-        super().__init__(tap=tap, name=tap.name, schema=schema)
-        self.config = config or {}  # <--- AND ADD THIS LINE
+        super().__init__(tap=tap, name=name, schema=schema)
+        # Use a non-conflicting name for the stream's config
+        self._stream_config = config or {}
 
         if primary_keys is None:
             primary_keys = []
@@ -117,27 +116,21 @@ class DynamicStream(RestApiStream):
         self.except_keys = except_keys
         self.records_path = records_path
 
-        # Optional enhancements
         self.inject_metadata = inject_metadata or {}
         self.id_registry_config = id_registry_config or {}
-        self._id_registry_cache: set[str] = set()  # dedupe within this run
-        self.max_records_limit = max_records_limit  # Per-stream record limit
-        self._records_processed = 0  # Track records processed in this stream
-
-        # Store pagination styles FIRST, before any conditional logic
+        self._id_registry_cache: set[str] = set()
+        self.max_records_limit = max_records_limit
+        self._records_processed = 0
         self.pagination_request_style = pagination_request_style
         self.pagination_response_style = pagination_response_style
         
-        # Respect stream-level next_page_token_path when provided.
         if next_page_token_path:
             self.next_page_token_jsonpath = next_page_token_path
         elif (
             self.pagination_request_style == "jsonpath_paginator"
             or self.pagination_request_style == "default"
         ):
-            self.next_page_token_jsonpath = (
-                "$.next_page"  # Set default for jsonpath_paginator
-            )
+            self.next_page_token_jsonpath = "$.next_page"
 
         get_url_params_styles = {
             "style1": self._get_url_params_offset_style,
@@ -161,7 +154,6 @@ class DynamicStream(RestApiStream):
                 pagination_response_style, self._get_url_params_page_style
             )
 
-        # Pagination configuration
         self.pagination_results_limit = pagination_results_limit
         self.pagination_next_page_param = pagination_next_page_param
         self.pagination_limit_per_page_param = pagination_limit_per_page_param
@@ -177,36 +169,22 @@ class DynamicStream(RestApiStream):
             if pagination_page_size:
                 self.pagination_page_size = pagination_page_size
             else:
-                if self.pagination_limit_per_page_param:
-                    page_limit_param = self.pagination_limit_per_page_param
-                else:
-                    page_limit_param = "per_page"
-                self.pagination_page_size = int(
-                    self.params.get(page_limit_param, 25)
-                )
+                page_limit_param = self.pagination_limit_per_page_param or "per_page"
+                self.pagination_page_size = int(self.params.get(page_limit_param, 25))
         elif (
             self.pagination_request_style == "style1"
             or self.pagination_request_style == "offset_paginator"
         ):
             if self.pagination_results_limit:
-                self.ABORT_AT_RECORD_COUNT = (
-                    self.pagination_results_limit
-                )
+                self.ABORT_AT_RECORD_COUNT = self.pagination_results_limit
             if pagination_page_size:
                 self.pagination_page_size = pagination_page_size
             else:
-                if self.pagination_limit_per_page_param:
-                    page_limit_param = self.pagination_limit_per_page_param
-                else:
-                    page_limit_param = "limit"
-                self.pagination_page_size = int(
-                    self.params.get(page_limit_param, 25)
-                )
+                page_limit_param = self.pagination_limit_per_page_param or "limit"
+                self.pagination_page_size = int(self.params.get(page_limit_param, 25))
         else:
             if self.pagination_results_limit:
-                self.ABORT_AT_RECORD_COUNT = (
-                    self.pagination_results_limit
-                )
+                self.ABORT_AT_RECORD_COUNT = self.pagination_results_limit
             self.pagination_page_size = pagination_page_size
         
         self.use_fake_since_parameter = False
@@ -350,19 +328,15 @@ class DynamicStream(RestApiStream):
             next_page_param = self.pagination_next_page_param or "page"
             params[next_page_param] = next_page_token
 
-        # `get_starting_timestamp` correctly gets the bookmark from the state file
-        # or falls back to the `start_date` on the first run.
         start_date = self.get_starting_timestamp(context)
         
-        # This tap has a custom `replication_request_adapter` config. We apply it here.
-        rra_config = self.config.get("replication_request_adapter")
+        rra_config = self._stream_config.get("replication_request_adapter")
         if self.replication_key and start_date and rra_config:
             mode = rra_config.get("mode")
             key = rra_config.get("key")
             
             if mode == "add_query_suffix":
                 template = rra_config.get("template", "")
-                # Use the correct variable from the template
                 if "${start_date_iso}" in template:
                     iso_date = start_date.strftime("%Y-%m-%dT%H:%M:%S")
                     suffix = template.replace("${start_date_iso}", iso_date)
@@ -567,19 +541,21 @@ class DynamicStream(RestApiStream):
                 self.logger.info(
                     f"Stream '{self.name}' reached its record limit of {self.max_records_limit}."
                 )
-                break  # Stop processing records from this page and stream
+                break
 
             # Check 2: Global tap limit
             if self.tap.max_ingestion_limit and self.tap.total_records_processed >= self.tap.max_ingestion_limit:
-                self.tap.logger.info(
-                    f"Tap has reached its global ingestion limit of {self.tap.max_ingestion_limit}."
-                )
-                self.tap.reached_max_limit = True
-                break 
+                if not self.tap.reached_max_limit: # Log message only once
+                    self.tap.logger.info(
+                        f"Tap has reached its global ingestion limit of {self.tap.max_ingestion_limit}."
+                    )
+                    self.tap.reached_max_limit = True
+                break
             
             yield record
             self._records_processed += 1
-            self.tap.total_records_processed += 1
+            if hasattr(self.tap, 'total_records_processed'):
+                self.tap.total_records_processed += 1
     # ----------------------------
     # Registry capture (Tweet IDs)
     # ----------------------------

@@ -670,7 +670,6 @@ class TapRestApiMsdk(Tap):
 
         def _make_stream(stream_cfg: dict, inject_meta: Optional[dict] = None) -> DynamicStream:
             """Create a DynamicStream with fully-resolved per-stream settings."""
-            # Resolve config overlays from the top-level config
             records_path = stream_cfg.get("records_path", self.config.get("records_path", "$[*]"))
             except_keys = stream_cfg.get("except_keys", self.config.get("except_keys", []))
             path = stream_cfg.get("path", self.config.get("path", ""))
@@ -678,7 +677,6 @@ class TapRestApiMsdk(Tap):
             headers = {**self.config.get("headers", {}), **stream_cfg.get("headers", {})}
             replication_key = stream_cfg.get("replication_key", self.config.get("replication_key"))
 
-            # Schema resolution: Use schema from config if present, otherwise infer it.
             schema: Dict[str, Any] = {}
             schema_config = stream_cfg.get("schema")
             if isinstance(schema_config, str):
@@ -701,12 +699,9 @@ class TapRestApiMsdk(Tap):
                     headers,
                 )
             
-            # Per-stream pagination overrides (fallback to top-level if absent).
             next_page_token_path = stream_cfg.get("next_page_token_path", self.config.get("next_page_token_path"))
             pagination_next_page_param = stream_cfg.get("pagination_next_page_param", self.config.get("pagination_next_page_param"))
 
-            # Note: We now pass the entire stream_cfg to the DynamicStream.
-            # This allows the stream to access its own 'replication_request_adapter' config.
             return DynamicStream(
                 tap=self,
                 name=stream_cfg["name"],
@@ -726,10 +721,9 @@ class TapRestApiMsdk(Tap):
                 id_registry_config=stream_cfg.get("id_registry_config"),
                 inject_metadata=inject_meta or {},
                 authenticator=self._authenticator,
-                config=stream_cfg  # Pass stream-specific config
+                config=stream_cfg
             )
 
-        # Main expansion loop: Process each stream definition from meltano.yml
         for base_stream in self.config.get("streams", []):
             if self.reached_max_limit:
                 self.logger.info("Global record limit reached, skipping remaining streams.")
@@ -737,7 +731,6 @@ class TapRestApiMsdk(Tap):
 
             iter_cfg = base_stream.get("iteration_config")
             if not iter_cfg:
-                # No iteration: build a single stream as-is.
                 streams.append(_make_stream(base_stream))
                 continue
 
