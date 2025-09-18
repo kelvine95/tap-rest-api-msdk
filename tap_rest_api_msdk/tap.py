@@ -1,16 +1,13 @@
-"""REST API Tap class."""
+"""A simplified Tap for the Twitter API."""
 
 import copy
-import json
-from genson import SchemaBuilder
+from typing import Any, Dict, List, Optional
 from singer_sdk import Tap
 from singer_sdk import typing as th
-from typing import Any, Dict, List, Optional
-from tap_rest_api_msdk.streams import DynamicStream
+from tap_rest_api_msdk.streams import DynamicTwitterStream
 
-# The class name is reverted to match the original entrypoint script.
 class TapRestApiMsdk(Tap):
-    """REST API Tap class."""
+    """Twitter API Tap class."""
     name = "tap-rest-api-msdk"
 
     config_jsonschema = th.PropertiesList(
@@ -27,9 +24,9 @@ class TapRestApiMsdk(Tap):
         self.max_ingestion_limit = self.config.get("max_ingestion_limit")
         self.reached_max_limit = False
 
-    def discover_streams(self) -> List[DynamicStream]:
+    def discover_streams(self) -> List[DynamicTwitterStream]:
         """Return a list of discovered streams."""
-        streams: List[DynamicStream] = []
+        streams: List[DynamicTwitterStream] = []
 
         for base_stream_config in self.config.get("streams", []):
             if self.reached_max_limit:
@@ -38,14 +35,7 @@ class TapRestApiMsdk(Tap):
 
             iter_cfg = base_stream_config.get("iteration_config")
             if not iter_cfg:
-                streams.append(
-                    DynamicStream(
-                        tap=self,
-                        name=base_stream_config["name"],
-                        schema=base_stream_config["schema"],
-                        config=base_stream_config,
-                    )
-                )
+                streams.append(DynamicTwitterStream(tap=self, name=base_stream_config["name"], schema=base_stream_config["schema"], config=base_stream_config))
                 continue
 
             values: List[Any] = []
@@ -53,23 +43,15 @@ class TapRestApiMsdk(Tap):
             
             if "from_registry" in iter_cfg:
                 reg_key = str(iter_cfg["from_registry"])
-                # Check if the registry key exists and is not empty
                 if not self.state.get("registry", {}).get(reg_key):
-                    self.logger.info(
-                        f"Skipping stream '{base_stream_config['name']}' for this run because its "
-                        f"source registry '{reg_key}' is empty or has not yet been populated."
-                    )
+                    self.logger.info(f"Skipping stream '{base_stream_config['name']}' because its source registry '{reg_key}' is empty.")
                     continue
                 values = self.state["registry"][reg_key]
-            
             elif "values" in iter_cfg:
                 values = list(iter_cfg["values"])
 
             if not values:
-                self.logger.warning(
-                    f"Skipping stream '{base_stream_config['name']}' because no values were "
-                    "found for its iteration_config."
-                )
+                self.logger.warning(f"Skipping stream '{base_stream_config['name']}' because no values were found for its iteration_config.")
                 continue
 
             for val in values:
@@ -82,13 +64,6 @@ class TapRestApiMsdk(Tap):
                 if "metadata_key" in iter_cfg:
                     s_config["inject_metadata"] = {iter_cfg["metadata_key"]: val}
                 
-                streams.append(
-                    DynamicStream(
-                        tap=self,
-                        name=s_config["name"],
-                        schema=s_config["schema"],
-                        config=s_config,
-                    )
-                )
+                streams.append(DynamicTwitterStream(tap=self, name=s_config["name"], schema=s_config["schema"], config=s_config))
         return streams
     

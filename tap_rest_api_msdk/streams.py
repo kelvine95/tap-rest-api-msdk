@@ -1,12 +1,11 @@
 """Stream type classes for the Twitter API tap."""
-
+from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
 import requests
 from singer_sdk.helpers.jsonpath import extract_jsonpath
-from singer_sdk.streams import RESTStream
-from singer_sdk.authenticators import APIKeyAuthenticator
+from tap_rest_api_msdk.client import TwitterApiStream
 from tap_rest_api_msdk.utils import flatten_json
 
 def _epoch_seconds(dt_obj: datetime) -> int:
@@ -15,35 +14,23 @@ def _epoch_seconds(dt_obj: datetime) -> int:
         dt_obj = dt_obj.replace(tzinfo=timezone.utc)
     return int(dt_obj.timestamp())
 
-class DynamicStream(RESTStream):
+class DynamicTwitterStream(TwitterApiStream):
     """A dynamic stream that handles pagination, limits, and incremental loading."""
-    url_base = "https://api.twitterapi.io"
-    
+
     def __init__(self, tap: Any, name: str, schema: dict, config: dict) -> None:
         """Initialize the stream."""
         super().__init__(tap=tap, name=name, schema=schema)
         self._stream_config = config
-        self._records_processed = 0
+        self._records_processed: int = 0
 
     @property
     def path(self) -> str:
         """Return the API path for the stream."""
         return self._stream_config.get("path", "")
 
-    @property
-    def authenticator(self) -> APIKeyAuthenticator:
-        """Return a new authenticator object."""
-        return APIKeyAuthenticator.create_for_stream(
-            self,
-            key="X-API-Key",
-            value=self.config.get("api_keys", {}).get("X-API-Key", ""),
-            location="header",
-        )
-
     def get_url_params(self, context: Optional[dict], next_page_token: Optional[Any]) -> Dict[str, Any]:
         """Return a dictionary of values to be used in URL parameterization."""
         params = self._stream_config.get("params", {}).copy()
-
         if next_page_token:
             params["cursor"] = next_page_token
 
@@ -63,7 +50,6 @@ class DynamicStream(RESTStream):
                         params[key] += suffix
                     else:
                         params[key] = suffix
-            
             elif mode == "param":
                 transform = rra_config.get("transform")
                 if transform == "epoch_seconds":
@@ -121,7 +107,6 @@ class DynamicStream(RESTStream):
         if tweet_id not in reg_list:
             reg_list.append(tweet_id)
             self._tap.state["registry"] = reg
-            self._tap.persist_state()
 
     def post_process(self, row: dict, context: Optional[dict] = None) -> Optional[dict]:
         """Transform record data, format dates, and register IDs."""
@@ -143,4 +128,3 @@ class DynamicStream(RESTStream):
         self._maybe_register_id(flat_record=flat_record, original_row=row)
         
         return flat_record
-    
